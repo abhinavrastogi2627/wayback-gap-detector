@@ -66,7 +66,7 @@ python waygap.py TARGET_URL [OPTIONS]
 | `--cache FILE` | `archived_cdx.db` | CDX取得結果のキャッシュファイル（SQLite） |
 | `--refresh` | — | 既存キャッシュを無視して再構築 |
 | `--no-cache` | — | 一時DBを使用（キャッシュを再利用も保持もしない） |
-| `--page-size N` | *(サーバ 既定値)* | CDX paginationのページサイズ（web.archive.org の既定は1ブロック/ページ） |
+| `--page-size N` | *(サーバ既定値)* | CDX paginationのページサイズ（web.archive.org の既定は1ブロック/ページ） |
 | `--workers N` | `4` | 並列ページ取得のワーカー数 |
 | `--batch-size N` | `500` | DB照合時のURL照会バッチサイズ |
 | `--output-archived [FILE]` | `archived.txt` | アーカイブ済みURL（照合された手元入力行）もファイルに書き出す |
@@ -96,14 +96,7 @@ python waygap.py "https://example.com/blog/*" \
   --output missing.txt
 ```
 
-### アーカイブ済みURLを別ファイルに収集
-
-```bash
-python waygap.py "https://example.com/blog/*" \
-  --input urls.txt \
-  --output not_archived.txt \
-  --output-archived archived.txt
-```
+`--output-archived archived.txt` により、アーカイブ済みURLの出力ファイルを指定することも可能です。
 
 ### 中断した取得の再開
 
@@ -112,13 +105,6 @@ paginationモード（既定）は自動で再開します: 完了済みペー�
 `--resume-key` が必要になるのは `resumeKey` フォールバック経路（サーバがpagination非対応の場合）のみです。フォールバック実行が途中で失敗すると、ツールは `resumeKey` の値をログに出力するので、元のコマンドに追加して続行します:
 
 ```bash
-# 例 - 失敗した元のコマンド:
-python waygap.py "https://example.com/blog/*" \
-  --input urls.txt \
-  --cache my_cache.db \
-  --limit 50000
-
-# --resume-key を追加して再開（KEY はエラーメッセージに出力されます）:
 python waygap.py "https://example.com/blog/*" \
   --input urls.txt \
   --cache my_cache.db \
@@ -162,104 +148,24 @@ CDX応答と手元URLリストの**両辺**を、同一のフラグ設定で [su
 
 ---
 
-## 開発環境のセットアップ
+## 開発
 
-開発には [uv](https://docs.astral.sh/uv/) を使用します。uvをインストールしたあと、次のコマンドで仮想環境（`.venv`）の作成と依存関係のインストールが完了します。必要なPythonがない場合は、uvが自動で用意します。
+開発には [uv](https://docs.astral.sh/uv/) を使用します。`uv sync` で仮想環境（`.venv`）の作成と依存関係のインストールが完了します（必要なPythonも自動で用意されます）。
 
 ```bash
-git clone https://github.com/nabikita3974/wayback-gap-detector.git
-cd wayback-gap-detector
 uv sync
+uv run python -m unittest discover -v   # テスト（外部ネットワーク呼び出しなし。API呼び出しはモック化）
+uv run ruff check .                     # Lint
+uv run ruff format --check .            # フォーマットチェック
+uv run basedpyright                     # 型チェック
 ```
 
-コマンドは `uv run` を付けて実行します（仮想環境の有効化は不要です）。
+CIでも同じチェックを実行します。`uv add` で依存関係を変更したら、`requirements.txt` を
+`uv export --no-dev --no-hashes --no-emit-project -o requirements.txt` で再生成してください。
+内部設計は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。`git blame` からフォーマットコミットを除外するには
+`git config blame.ignoreRevsFile .git-blame-ignore-revs` を実行します。
 
-```bash
-uv run python waygap.py "https://example.com/blog/*" --input urls.txt
-uv run python -m unittest discover -v
-```
-
-依存関係を追加・更新するときは `uv add <パッケージ名>` を使い、`requirements.txt` を再生成してください。
-
-```bash
-uv export --no-dev --no-hashes --no-emit-project -o requirements.txt
-```
-
-コードのチェックと整形には [Ruff](https://docs.astral.sh/ruff/) を使用します。
-
-```bash
-uv run ruff check .      # Lint（--fix を付けると安全な修正を自動適用）
-uv run ruff format .     # フォーマット
-```
-
-型チェックには [basedpyright](https://docs.basedpyright.com/latest/) を使用します:
-
-```bash
-uv run basedpyright .    # 型チェック
-```
-
-フォーマットコミットによって`git blame`が断片化されるのを防ぐため、このリポジトリでは`.git-blame-ignore-revs`を使用しています。
-
-ローカルで有効にするには、以下のコマンドを実行してください。
-
-```bash
-git config blame.ignoreRevsFile .git-blame-ignore-revs
-```
-
----
-
-## テストの実行
-
-```bash
-python -m unittest discover -v
-```
-
-またはテストファイルを直接実行:
-
-```bash
-python test_waygap.py
-```
-
-すべてのテストは外部ネットワーク呼び出しを行いません（API呼び出しはモック化されています）。
-
----
-
-## プロジェクト構成
-
-```
-wayback-gap-detector/
-├── waygap.py           # メインスクリプト
-├── test_waygap.py      # ユニットテスト
-├── ARCHITECTURE.md     # アーキテクチャ解説（関数一覧・データフロー）
-├── AGENTS.md           # AIコーディングエージェント向けの指示
-├── LICENSE             # AGPL-3.0-or-later
-├── README.md           # 英語版 README
-├── README_ja.md        # このファイル（日本語版）
-├── pyproject.toml      # プロジェクト設定・依存関係
-├── uv.lock             # ロックファイル（uvが管理）
-├── .python-version     # 開発時に使うPythonのバージョン
-├── requirements.txt    # Python依存ライブラリ（pyproject.tomlから生成）
-├── .github/dependabot.yml  # Dependabot設定（GitHub Actionsの更新）
-├── .github/ISSUE_TEMPLATE/  # Issueテンプレート（バグ報告、作業・改善）
-├── .github/workflows/tests.yml  # CI（テスト・Lint・型チェック）
-├── .git-blame-ignore-revs  # git blameが無視するコミットハッシュ一覧（機械的な大規模コミット）
-└── .gitignore          # Git ignore ルール
-```
-
----
-
-## コントリビューション
-
-貢献を歓迎します！
-
-1. リポジトリをフォークし、機能ブランチを作成してください。
-2. 変更を加え、必要に応じてテストを追加・更新してください。
-3. 依存関係を変更した場合は、`pyproject.toml`・`uv.lock`・`requirements.txt` をそろえてコミットしてください（手順は「開発環境のセットアップ」を参照）。
-4. Lint・フォーマット・型チェックが通ることを確認してください: `uv run ruff check .`、`uv run ruff format --check .`、`uv run basedpyright .`
-5. すべてのテストが通ることを確認してください: `uv run python -m unittest discover -v`
-6. 何を・なぜ変更したのかを明確に記述したプルリクエストを出してください。
-
-プルリクエストは1つ1つの論理的変更に絞ってください。
+Issueやプルリクエストは歓迎します。プルリクエストは1つの論理的変更に絞ってください。
 
 ---
 
