@@ -172,7 +172,7 @@ and installs all dependencies (and Python itself, if needed).
 
 ```bash
 uv sync
-uv run python -m unittest discover -v   # tests (no network access; API calls are mocked)
+uv run pytest                           # tests (no network access; API calls are mocked)
 uv run ruff check .                     # lint
 uv run ruff format --check .            # format check
 uv run basedpyright                     # type check

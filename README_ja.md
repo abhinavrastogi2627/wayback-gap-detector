@@ -154,7 +154,7 @@ CDX応答と手元URLリストの**両辺**を、同一のフラグ設定で [su
 
 ```bash
 uv sync
-uv run python -m unittest discover -v   # テスト（外部ネットワーク呼び出しなし。API呼び出しはモック化）
+uv run pytest                           # テスト（外部ネットワーク呼び出しなし。API呼び出しはモック化）
 uv run ruff check .                     # Lint
 uv run ruff format --check .            # フォーマットチェック
 uv run basedpyright                     # 型チェック
