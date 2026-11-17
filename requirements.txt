@@ -6,22 +6,13 @@ charset-normalizer==3.5.2
     # via requests
 colorama==0.4.6 ; sys_platform == 'win32'
     # via tqdm
-filelock==3.19.1 ; python_full_version < '3.10'
-    # via tldextract
-filelock==4.1.0 ; python_full_version == '3.10.*'
-    # via tldextract
-filelock==4.2.6 ; python_full_version >= '3.11'
+filelock==4.2.6
     # via tldextract
 idna==3.20
     # via
     #   requests
     #   tldextract
-requests==2.32.5 ; python_full_version < '3.10'
-    # via
-    #   requests-file
-    #   tldextract
-    #   wayback-gap-detector
-requests==2.34.2 ; python_full_version >= '3.10'
+requests==2.34.2
     # via
     #   requests-file
     #   tldextract
@@ -32,17 +23,11 @@ six==1.17.0
     # via surt
 surt==0.3.1
     # via wayback-gap-detector
-tldextract==5.3.0 ; python_full_version < '3.10'
-    # via surt
-tldextract==5.4.0 ; python_full_version >= '3.10'
+tldextract==5.4.0
     # via surt
 tqdm==4.70.1
     # via wayback-gap-detector
-urllib3==2.6.3 ; python_full_version < '3.10'
-    # via
-    #   requests
-    #   wayback-gap-detector
-urllib3==2.8.0 ; python_full_version >= '3.10'
+urllib3==2.8.0
     # via
     #   requests
     #   wayback-gap-detector
