@@ -231,6 +231,7 @@ wayback-gap-detector/
 ├── waygap.py           # メインスクリプト
 ├── test_waygap.py      # ユニットテスト
 ├── ARCHITECTURE.md     # アーキテクチャ解説（関数一覧・データフロー）
+├── AGENTS.md           # AIコーディングエージェント向けの指示
 ├── LICENSE             # AGPL-3.0-or-later
 ├── README.md           # 英語版 README
 ├── README_ja.md        # このファイル（日本語版）
