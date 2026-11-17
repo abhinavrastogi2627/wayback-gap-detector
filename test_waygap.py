@@ -37,6 +37,7 @@ from waygap import (
     ensure_archived_db,
     extract_archived_urls,
     fetch_page_rows,
+    fetch_resumekey_rows,
     get_num_pages,
     insert_urls,
     key_profile,
@@ -584,11 +585,22 @@ class TestSplitResumeKey(unittest.TestCase):
         self.assertIsNone(key)
         self.assertEqual(len(rows), 3)
 
-    def test_non_url_singleton_is_a_key(self):
+    def test_non_url_singleton_without_separator_is_not_a_key(self):
         data = [["original"], ["http://a.example/"], ["SOMEKEY"]]
         rows, key = _split_resume_key(data)
-        self.assertEqual(key, "SOMEKEY")
-        self.assertEqual(len(rows), 2)
+        self.assertIsNone(key)
+        self.assertEqual(rows, data)
+
+    def test_trailing_non_url_data_row_is_kept(self):
+        data = [["original"], ["http://a.example/"], ["dns:a.example"]]
+        rows, key = _split_resume_key(data)
+        self.assertIsNone(key)
+        self.assertEqual(rows, data)
+
+    def test_header_only_response_has_no_key(self):
+        rows, key = _split_resume_key([["original"]])
+        self.assertIsNone(key)
+        self.assertEqual(rows, [["original"]])
 
 
 class TestSQLiteCache(unittest.TestCase):
@@ -714,6 +726,94 @@ class TestFetchPageRowsChaining(unittest.TestCase):
 
         self.assertEqual(mock_session.get.call_count, 2)
         self.assertEqual(len(rows), 2)
+
+    @patch("requests.Session")
+    def test_trailing_non_url_row_is_kept(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.return_value = _json_response(
+            [["original"], ["http://a.example/"], ["dns:a.example"]]
+        )
+
+        rows = fetch_page_rows("http://example.com/*", 0, None, None, mock_session, {})
+
+        self.assertEqual(mock_session.get.call_count, 1)
+        self.assertEqual(rows, [["http://a.example/"], ["dns:a.example"]])
+
+    @patch("requests.Session")
+    def test_header_only_page_makes_no_extra_request(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.return_value = _json_response([["original"]])
+
+        rows = fetch_page_rows("http://example.com/*", 0, None, None, mock_session, {})
+
+        self.assertEqual(mock_session.get.call_count, 1)
+        self.assertEqual(rows, [])
+
+
+def _drain(gen):
+    """Collect a generator's yielded items and its return value."""
+    items = []
+    while True:
+        try:
+            items.append(next(gen))
+        except StopIteration as stop:
+            return items, stop.value
+
+
+class TestFetchResumeKeyRows(unittest.TestCase):
+    """Tests for resumeKey detection in the sequential fallback fetch."""
+
+    @patch("requests.Session")
+    def test_separator_key_is_followed(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [
+            _json_response([["original"], ["http://a.example/"], [], ["KEY1"]]),
+            _json_response([["original"], ["http://b.example/"]]),
+        ]
+
+        rows, last_key = _drain(
+            fetch_resumekey_rows(
+                "http://example.com/*", None, None, None, mock_session, {}
+            )
+        )
+
+        self.assertEqual(rows, [["http://a.example/"], ["http://b.example/"]])
+        self.assertIsNone(last_key)
+        self.assertEqual(mock_session.get.call_count, 2)
+        second_params = mock_session.get.call_args_list[1].kwargs["params"]
+        self.assertEqual(second_params.get("resumeKey"), "KEY1")
+
+    @patch("requests.Session")
+    def test_trailing_non_url_row_is_kept(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.return_value = _json_response(
+            [["original"], ["http://a.example/"], ["dns:a.example"]]
+        )
+
+        rows, last_key = _drain(
+            fetch_resumekey_rows(
+                "http://example.com/*", None, None, None, mock_session, {}
+            )
+        )
+
+        self.assertEqual(rows, [["http://a.example/"], ["dns:a.example"]])
+        self.assertIsNone(last_key)
+        self.assertEqual(mock_session.get.call_count, 1)
+
+    @patch("requests.Session")
+    def test_header_only_response_is_a_normal_end(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.return_value = _json_response([["original"]])
+
+        rows, last_key = _drain(
+            fetch_resumekey_rows(
+                "http://example.com/*", None, None, None, mock_session, {}
+            )
+        )
+
+        self.assertEqual(rows, [])
+        self.assertIsNone(last_key)
+        self.assertEqual(mock_session.get.call_count, 1)
 
 
 class TestCDXPaginationDB(unittest.TestCase):
@@ -1003,6 +1103,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestSplitResumeKey))
     suite.addTests(loader.loadTestsFromTestCase(TestSQLiteCache))
     suite.addTests(loader.loadTestsFromTestCase(TestFetchPageRowsChaining))
+    suite.addTests(loader.loadTestsFromTestCase(TestFetchResumeKeyRows))
     suite.addTests(loader.loadTestsFromTestCase(TestCDXPaginationDB))
     suite.addTests(loader.loadTestsFromTestCase(TestVersion))
 
