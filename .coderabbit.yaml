@@ -1,0 +1,95 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "en-US"
+
+# Max 250 characters.
+tone_instructions: "Be concise. Always explain why an issue matters and label its severity (high/medium/low)."
+
+early_access: false
+
+reviews:
+  # chill = focus on significant issues / assertive = also flag minor details.
+  profile: "chill"
+
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+
+  auto_review:
+    enabled: true
+    # Draft PRs are reviewed once marked "Ready for review".
+    drafts: false
+    ignore_title_keywords:
+      - "WIP"
+      - "skip review"
+
+  path_filters:
+    - "!uv.lock"
+
+  path_instructions:
+    - path: "**"
+      instructions: |
+        - Prioritize bugs, data loss, and security issues over everything else.
+        - Do not comment on anything ruff (lint/format) or basedpyright already
+          enforces in CI.
+        - Avoid purely stylistic or preference-based suggestions.
+    - path: "waygap.py"
+      instructions: |
+        - Key consistency: CDX `original` rows and local input URLs must be
+          keyed with the same `normalize_key` / `key_opts`. Flag any path that
+          keys one side differently, or that breaks lenient/strict mode
+          (`collapse=urlkey` vs `collapse=original`).
+        - Cache correctness: changes that affect cache identity must be
+          reflected in `expected_meta` (`key_profile`, `schema_v`). Check that
+          `completed` / `pages_done` stay consistent when a run is interrupted
+          and resumed, so no page is silently skipped.
+        - CDX fetching: pagination and resumeKey handling must not drop or
+          duplicate rows; `showNumPages` must use the same `pageSize` /
+          `collapse` as page fetches. Check retries, timeouts, and the thread
+          pool for unhandled exceptions or leaked resources.
+        - Input files can be very large: keep input matching streaming and
+          memory-bounded.
+        - Key generation must stay DNS-free (no `socket` lookups).
+        - Flag swallowed exceptions and mutable default arguments.
+    - path: "test_waygap.py"
+      instructions: |
+        - Tests must not make real network calls; every CDX/API request must
+          be mocked.
+        - Check that tests verify the intended behavior and cover edge cases
+          (empty input, lenient vs strict keys, interrupted/resumed caches,
+          missing pagination support).
+    - path: ".github/workflows/**"
+      instructions: |
+        - Check secret handling, least-privilege `permissions`, and pinned
+          versions of third-party actions.
+
+  pre_merge_checks:
+    title:
+      mode: "warning"
+      requirements: "Follow Conventional Commits (`type: subject`), with the subject in English."
+    custom_checks:
+      - name: "Docs in sync"
+        mode: "warning"
+        instructions: |
+          If README.md or README_ja.md changes, the other must be updated with
+          equivalent content. If functions, signatures, or the data flow in
+          waygap.py change, ARCHITECTURE.md must be updated accordingly.
+      - name: "Dependencies in sync"
+        mode: "warning"
+        instructions: |
+          If dependencies change, pyproject.toml, uv.lock, and requirements.txt
+          must all be updated together.
+
+  tools:
+    # ruff already runs in CI; other Python linters would conflict with the
+    # ruff configuration in pyproject.toml.
+    ruff:
+      enabled: false
+    flake8:
+      enabled: false
+    pylint:
+      enabled: false
+
+chat:
+  auto_reply: true
