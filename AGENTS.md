@@ -11,7 +11,7 @@ internal design and [README.md](README.md) for usage.
 
 ```bash
 uv sync                                   # install dependencies
-uv run python -m unittest discover -v     # tests
+uv run pytest                             # tests
 uv run ruff check .                       # lint
 uv run ruff format --check .              # format check
 uv run basedpyright                       # type check
