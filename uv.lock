@@ -339,10 +339,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "requests", specifier = ">=2.25.0" },
+    { name = "requests", specifier = ">=2.28.0" },
     { name = "surt", specifier = "==0.3.1" },
-    { name = "tqdm", specifier = ">=4.60.0" },
-    { name = "urllib3", specifier = ">=1.26.0" },
+    { name = "tqdm", specifier = ">=4.65.0" },
+    { name = "urllib3", specifier = ">=1.26.8" },
 ]
 
 [package.metadata.requires-dev]
