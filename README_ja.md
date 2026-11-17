@@ -239,6 +239,7 @@ wayback-gap-detector/
 ├── .python-version     # 開発時に使うPythonのバージョン
 ├── requirements.txt    # Python依存ライブラリ（pyproject.tomlから生成）
 ├── .github/dependabot.yml  # Dependabot設定（GitHub Actionsの更新）
+├── .github/ISSUE_TEMPLATE/  # Issueテンプレート（バグ報告、作業・改善）
 ├── .github/workflows/tests.yml  # CI（テスト・Lint・型チェック）
 ├── .git-blame-ignore-revs  # git blameが無視するコミットハッシュ一覧（機械的な大規模コミット）
 └── .gitignore          # Git ignore ルール
