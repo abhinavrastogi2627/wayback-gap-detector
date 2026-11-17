@@ -20,7 +20,7 @@
 
 ## 要件
 
-- Python 3.9+（3.13でテスト済み）
+- Python 3.11+（3.11と3.15でテスト済み）
 - ライブラリ依存は [requirements.txt](requirements.txt) を参照
 
 ---

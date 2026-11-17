@@ -18,7 +18,7 @@ A command-line tool that compares a local list of URLs against the [Wayback Mach
 
 ## Requirements
 
-- Python 3.9+ (tested on 3.13)
+- Python 3.11+ (tested on 3.11 and 3.15)
 - See [requirements.txt](requirements.txt) for library dependencies
 
 ---

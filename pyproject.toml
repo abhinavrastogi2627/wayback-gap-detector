@@ -1,12 +1,12 @@
 [project]
 name = "wayback-gap-detector"
 version = "0.1.0"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
-    "requests>=2.25.0",
+    "requests>=2.28.0",
     "surt==0.3.1",
-    "tqdm>=4.60.0",
-    "urllib3>=1.26.0",
+    "tqdm>=4.65.0",
+    "urllib3>=1.26.8",
 ]
 
 [dependency-groups]
@@ -24,4 +24,4 @@ ignore = ["E501"]
 
 [tool.basedpyright]
 typeCheckingMode = "standard"
-pythonVersion = "3.9"
+pythonVersion = "3.11"
