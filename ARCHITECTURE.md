@@ -89,7 +89,7 @@ flowchart TD
 |---|---|
 | `make_session() -> requests.Session` | Creates a retrying `Session` (exponential backoff on 429/5xx) |
 | `_cdx_params(target_url, *, page=None, page_size=None, resume_key=None, limit=None, collapse=None) -> dict[str, Any]` | Builds request parameters shared by both fetch paths. `collapse` is `urlkey` for lenient and `original` for strict. `limit` is used only by the sequential resumeKey path |
-| `_split_resume_key(data: list) -> tuple[list, str \| None]` | Splits a trailing resumeKey off the response (without mistaking `fl=original` single-column data rows for it) |
+| `_split_resume_key(data: list) -> tuple[list, str \| None]` | Splits a trailing resumeKey off the raw response. Only the documented `[..., [], ["<resumeKey>"]]` pattern is recognised, so `fl=original` single-column data rows are never mistaken for it; callers remove empty rows only after this split |
 | `_strip_header(data: list) -> list` | Removes the header row (`urlkey`/`original`) at the start of a chunk |
 | `_get_with_retries(session, api_url, params, headers, timeout=60) -> Response` | GET with up to 3 retries, also detecting empty/non-JSON responses |
 | `get_num_pages(target_url, page_size, collapse, session, headers) -> int \| None` | Fetches the total page count via `showNumPages`. Sends the same `pageSize`/`collapse` as page fetches (the count must use the same query shape; returns `None` when unsupported) |

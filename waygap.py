@@ -432,24 +432,23 @@ def make_session() -> requests.Session:
 def _split_resume_key(data: list) -> tuple[list, str | None]:
     """Split a trailing resumeKey off a CDX JSON response.
 
-    Robust against fl=original (single-column data rows): a trailing
-    single-element row is only treated as a resumeKey if it does not look
-    like a data URL (documented separator `[]` pattern, or a non-URL string
-    when a full page was returned).
+    Only the documented JSON pattern `[..., [], ["<resumeKey>"]]` is
+    recognised. Without the empty separator row, a trailing single-element
+    row is a data row (fl=original rows are single-column), so callers must
+    pass the raw response before removing empty rows.
     """
     if not data:
         return data, None
     last = data[-1]
     if not (isinstance(last, list) and len(last) == 1 and isinstance(last[0], str)):
         return data, None
-    candidate = last[0]
-    # Documented JSON pattern: [..., [], ["<resumeKey>"]]
     if len(data) >= 2 and data[-2] == []:
-        return data[:-2], candidate
-    # Fallback heuristic for single-column rows: data rows (original URLs)
-    # always contain '://', resumeKeys never do.
-    if "://" not in candidate:
-        return data[:-1], candidate
+        return data[:-2], last[0]
+    if "://" not in last[0]:
+        logger.debug(
+            f"Trailing row without '://' and no resumeKey separator, "
+            f"not treated as a resumeKey: {last[0]!r}"
+        )
     return data, None
 
 
@@ -618,8 +617,8 @@ def fetch_page_rows(
             raise CDXAPIError(
                 f"CDX API returned unexpected type: {type(data).__name__}"
             )
-        data = [row for row in data if row != []]
         data, new_key = _split_resume_key(data)
+        data = [row for row in data if row != []]
         data = _strip_header(data)
         rows.extend([r for r in data if isinstance(r, list) and r])
         if new_key:
@@ -672,8 +671,8 @@ def fetch_resumekey_rows(
                 f"CDX API returned unexpected type: {type(data).__name__}"
             )
 
-        data = [row for row in data if row != []]
         data, new_key = _split_resume_key(data)
+        data = [row for row in data if row != []]
         if new_key and new_key in seen_response_keys:
             logger.warning(
                 f"Previously seen resumeKey returned again: {new_key} -> stopping"
