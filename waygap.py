@@ -65,6 +65,11 @@ __version__ = "0.1.0"
 USER_AGENT = f"Wayback-Gap-Detector/{__version__} (https://github.com/nabikita3974/wayback-gap-detector)"
 
 DB_SCHEMA_VERSION = "1"
+# Written to meta["resumekey_v"] when a resumeKey fallback fetch starts from
+# the beginning. Earlier versions could mark an incomplete resumeKey cache
+# as completed, so a completed resumeKey cache without it is fetched again.
+# Not part of expected_meta(): pagination caches are not affected.
+RESUMEKEY_FETCH_VERSION = "2"
 LOOKUP_BATCH_SIZE = 500
 INSERT_CHUNK_SIZE = 10000
 
@@ -838,10 +843,23 @@ def ensure_archived_db(
                 )
 
         if initial_resume_key is None and params_match and is_completed(conn):
-            logger.info(
-                f"Reusing completed cache: {cache_file} ({count_archived(conn)} URLs)"
-            )
-            return cache_file
+            if (
+                meta.get("mode") == "resumekey"
+                and meta.get("resumekey_v") != RESUMEKEY_FETCH_VERSION
+            ):
+                # Completed by an earlier version, which could mark an
+                # incomplete resumeKey fetch as completed.
+                logger.warning(
+                    f"{cache_file} was completed by an earlier version in "
+                    "resumeKey mode and may be missing rows; fetching again"
+                )
+                set_completed(conn, False)
+            else:
+                logger.info(
+                    f"Reusing completed cache: {cache_file} "
+                    f"({count_archived(conn)} URLs)"
+                )
+                return cache_file
 
         if not params_match and (meta or not columns_ok):
             # Stale cache (other schema/flags/target): rebuild instead of mixing.
@@ -878,7 +896,16 @@ def ensure_archived_db(
             logger.info("Falling back to resumeKey sequential fetch")
             # Record the mode before fetching, so an interrupted run can be
             # told apart from a pagination cache when --resume-key is used.
-            write_meta(conn, {"mode": "resumekey", "num_pages": "0"})
+            # resumekey_v marks a fetch that started from the beginning with
+            # this version; a --resume-key run keeps the cache's marker as is.
+            write_meta(
+                conn,
+                {
+                    "mode": "resumekey",
+                    "num_pages": "0",
+                    "resumekey_v": RESUMEKEY_FETCH_VERSION,
+                },
+            )
             gen = fetch_resumekey_rows(
                 target_url, None, limit, collapse, session, headers
             )

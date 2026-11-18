@@ -117,8 +117,9 @@ python waygap.py "https://example.com/blog/*" \
 
 `--resume-key` only continues an interrupted fallback fetch in the same cache:
 the cache file must exist, be incomplete, and have been built with the same
-target URL and options. Otherwise the tool stops with an error and leaves the
-cache untouched. It cannot be combined with `--no-cache` or `--refresh`.
+target URL and options. Otherwise the tool stops with an error without
+deleting or overwriting the cache. It cannot be combined with `--no-cache` or
+`--refresh`.
 
 ---
 
