@@ -635,11 +635,12 @@ def fetch_resumekey_rows(
     collapse: str | None,
     session: requests.Session,
     headers: dict,
-) -> Generator[list, None, str | None]:
+) -> Generator[list, None, None]:
     """Sequential resumeKey fetch (fallback path). Yields data rows.
 
-    Returns the last resumeKey via the generator return value (PEP 380),
-    so an interrupted run can be resumed with --resume-key.
+    Ends normally only when a response carries no resumeKey. If the server
+    repeats a resumeKey, raises CDXAPIError so that the caller does not
+    mark the partial result as complete.
     """
     api_url = "https://web.archive.org/cdx/search/cdx"
     params = _cdx_params(target_url, limit=limit, collapse=collapse)
@@ -652,8 +653,10 @@ def fetch_resumekey_rows(
     while True:
         if resume_key:
             if resume_key in seen_request_keys:
-                logger.warning(f"resumeKey cycle detected (request side): {resume_key}")
-                break
+                raise CDXAPIError(
+                    f"resumeKey cycle detected (request side): {resume_key}. "
+                    "The fetch was aborted; retry later with --refresh."
+                )
             seen_request_keys.add(resume_key)
             params["resumeKey"] = resume_key
 
@@ -674,26 +677,21 @@ def fetch_resumekey_rows(
         data, new_key = _split_resume_key(data)
         data = [row for row in data if row != []]
         if new_key and new_key in seen_response_keys:
-            logger.warning(
-                f"Previously seen resumeKey returned again: {new_key} -> stopping"
+            raise CDXAPIError(
+                f"Previously seen resumeKey returned again: {new_key}. "
+                "The fetch was aborted; retry later with --refresh."
             )
-            break
         if new_key:
             seen_response_keys.add(new_key)
         data = _strip_header(data)
 
         valid = [r for r in data if isinstance(r, list) and r]
-        if new_key and not valid:
-            logger.warning("No valid data rows in this chunk, stopping pagination")
-            resume_key = new_key
-            break
         yield from valid
-        if new_key:
-            resume_key = new_key
-        else:
-            resume_key = None
-            break
-    return resume_key
+        if not new_key:
+            return
+        # A chunk may carry a resumeKey but no data rows; keep following it
+        # (the cycle checks above stop a server that never advances).
+        resume_key = new_key
 
 
 def _rows_to_keys(rows: Iterable[list], key_opts: dict[str, Any] | None) -> list[str]:
@@ -743,6 +741,44 @@ def _fetch_pages_parallel(
             yield fut.result()
 
 
+def _store_resumekey_rows(
+    conn: sqlite3.Connection,
+    rows: Iterable[list],
+    key_opts: dict[str, Any] | None,
+) -> int:
+    """Insert keys for rows from fetch_resumekey_rows(). Returns rows inserted.
+
+    Pending keys are flushed on every exit, including a failed request or
+    Ctrl+C. The rows before the failed request were already fetched, so
+    dropping them would leave a gap that resuming from the logged
+    resumeKey cannot fill.
+    """
+    inserted = 0
+    batch: list[str] = []
+    with tqdm(desc="Fetching (resumeKey)", unit="rec") as bar:
+        try:
+            try:
+                for row in rows:
+                    if not isinstance(row, list) or not row:
+                        continue
+                    if isinstance(row[0], str) and row[0] and row[0].strip():
+                        batch.append(normalize_key(row[0], key_opts))
+                    if len(batch) >= INSERT_CHUNK_SIZE:
+                        insert_urls(conn, batch)
+                        inserted += len(batch)
+                        bar.update(len(batch))
+                        batch.clear()
+            finally:
+                if batch:
+                    insert_urls(conn, batch)
+                    inserted += len(batch)
+                    bar.update(len(batch))
+        except CDXAPIError:
+            logger.error(f"Progress saved ({inserted} records).")
+            raise
+    return inserted
+
+
 def ensure_archived_db(
     target_url: str,
     cache_file: str,
@@ -768,12 +804,38 @@ def ensure_archived_db(
         logger.info(f"Removing existing cache (--refresh): {cache_file}")
         os.remove(cache_file)
 
+    # --resume-key only continues an interrupted resumeKey fetch. Check this
+    # before open_db(), which would create an empty cache file.
+    if initial_resume_key is not None and not os.path.exists(cache_file):
+        raise CacheError(
+            f"--resume-key needs the cache of the interrupted fetch, "
+            f"but {cache_file} does not exist"
+        )
+
     expected = expected_meta(target_url, key_opts or {}, page_size)
     conn = open_db(cache_file)
     try:
         meta = read_meta(conn)
         columns_ok = archived_columns(conn) == {"key"}
         params_match = columns_ok and all(meta.get(k) == v for k, v in expected.items())
+
+        if initial_resume_key is not None:
+            # Reject before the stale-cache rebuild below deletes the file.
+            if not params_match:
+                raise CacheError(
+                    f"--resume-key needs a cache built with the same target URL "
+                    f"and options, but {cache_file} was built with other settings"
+                )
+            if is_completed(conn):
+                raise CacheError(
+                    f"{cache_file} is already complete; run without --resume-key "
+                    "to reuse it, or with --refresh to rebuild it"
+                )
+            if meta.get("mode") == "pagination":
+                raise CacheError(
+                    f"{cache_file} was built in pagination mode, which resumes "
+                    "automatically; run without --resume-key"
+                )
 
         if initial_resume_key is None and params_match and is_completed(conn):
             logger.info(
@@ -793,9 +855,6 @@ def ensure_archived_db(
         if not params_match:
             write_meta(conn, {**expected, "completed": "0"})
             set_completed(conn, False)
-        elif is_completed(conn) and initial_resume_key is not None:
-            # Explicit resume requested against a completed db: allow append.
-            set_completed(conn, False)
 
         # ResumeKey manual-resume path takes precedence when explicitly requested.
         if initial_resume_key is not None:
@@ -804,36 +863,7 @@ def ensure_archived_db(
             gen = fetch_resumekey_rows(
                 target_url, initial_resume_key, limit, collapse, session, headers
             )
-            inserted = 0
-            batch: list[str] = []
-            with tqdm(desc="Fetching (resumeKey)", unit="rec") as bar:
-                try:
-                    while True:
-                        try:
-                            row = next(gen)
-                        except StopIteration as stop:
-                            last_key = stop.value
-                            if last_key:
-                                write_meta(conn, {"last_resume_key": str(last_key)})
-                            break
-                        if not isinstance(row, list) or not row:
-                            continue
-                        if isinstance(row[0], str) and row[0] and row[0].strip():
-                            batch.append(normalize_key(row[0], key_opts))
-                        if len(batch) >= INSERT_CHUNK_SIZE:
-                            insert_urls(conn, batch)
-                            inserted += len(batch)
-                            bar.update(len(batch))
-                            batch.clear()
-                    if batch:
-                        insert_urls(conn, batch)
-                        inserted += len(batch)
-                        bar.update(len(batch))
-                except CDXAPIError:
-                    logger.error(
-                        f"Progress saved ({inserted} records). Resume with --resume-key."
-                    )
-                    raise
+            inserted = _store_resumekey_rows(conn, gen, key_opts)
             set_completed(conn, True)
             write_meta(conn, {"mode": "resumekey"})
             # Finalize single-file layout.
@@ -846,28 +876,14 @@ def ensure_archived_db(
         num_pages = get_num_pages(target_url, page_size, collapse, session, headers)
         if num_pages is None or num_pages <= 0:
             logger.info("Falling back to resumeKey sequential fetch")
+            # Record the mode before fetching, so an interrupted run can be
+            # told apart from a pagination cache when --resume-key is used.
+            write_meta(conn, {"mode": "resumekey", "num_pages": "0"})
             gen = fetch_resumekey_rows(
                 target_url, None, limit, collapse, session, headers
             )
-            inserted = 0
-            batch = []
-            with tqdm(desc="Fetching (resumeKey)", unit="rec") as bar:
-                for row in gen:
-                    if not isinstance(row, list) or not row:
-                        continue
-                    if isinstance(row[0], str) and row[0] and row[0].strip():
-                        batch.append(normalize_key(row[0], key_opts))
-                    if len(batch) >= INSERT_CHUNK_SIZE:
-                        insert_urls(conn, batch)
-                        inserted += len(batch)
-                        bar.update(len(batch))
-                        batch.clear()
-                if batch:
-                    insert_urls(conn, batch)
-                    inserted += len(batch)
-                    bar.update(len(batch))
+            inserted = _store_resumekey_rows(conn, gen, key_opts)
             set_completed(conn, True)
-            write_meta(conn, {"mode": "resumekey", "num_pages": "0"})
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             logger.info(f"All chunks fetched successfully ({inserted} records total)")
             return cache_file
@@ -1259,6 +1275,8 @@ examples:
     )
 
     args = parser.parse_args()
+    if args.resume_key is not None and (args.no_cache or args.refresh):
+        parser.error("--resume-key cannot be combined with --no-cache or --refresh")
 
     # Configure logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
