@@ -1029,6 +1029,47 @@ class TestResumeKeyCache(unittest.TestCase):
         self.assertEqual(meta.get("completed"), "1")
         self.assertEqual(meta.get("resumekey_v"), RESUMEKEY_FETCH_VERSION)
 
+    @staticmethod
+    def _route_fail_after_one_row(url, params=None, headers=None, timeout=None):
+        params = params or {}
+        if "showNumPages" in params:
+            return _no_pagination_response()
+        if params.get("resumeKey") is None:
+            return _json_response([["original"], ["http://a.example/"], [], ["KEY1"]])
+        raise requests.exceptions.ConnectionError("down")
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_resume_hint_logged_after_rows_are_saved(self, mock_session_cls, _sleep):
+        mock_session_cls.return_value.get.side_effect = self._route_fail_after_one_row
+
+        with self.assertLogs("waygap", level="INFO") as logs:
+            with self.assertRaises(CDXAPIError):
+                ensure_archived_db(TARGET, self.cache, workers=1)
+
+        messages = [r.getMessage() for r in logs.records]
+        saved = messages.index("Progress saved (1 records).")
+        hint = messages.index("  --resume-key KEY1")
+        self.assertLess(saved, hint)
+
+    @patch("waygap.insert_urls", side_effect=sqlite3.OperationalError("disk full"))
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_no_resume_hint_when_saving_rows_fails(
+        self, mock_session_cls, _sleep, _insert
+    ):
+        # The rows before KEY1 are not stored, so resuming from KEY1 would
+        # leave them missing from a cache that is later marked complete.
+        mock_session_cls.return_value.get.side_effect = self._route_fail_after_one_row
+
+        with self.assertLogs("waygap", level="INFO") as logs:
+            with self.assertRaises(sqlite3.OperationalError):
+                ensure_archived_db(TARGET, self.cache, workers=1)
+
+        messages = [r.getMessage() for r in logs.records]
+        self.assertFalse(any("--resume-key" in m for m in messages), messages)
+        self.assertFalse(any("Progress saved" in m for m in messages), messages)
+
     @patch("requests.Session")
     def test_rows_before_an_interrupt_survive(self, mock_session_cls):
         def _route(url, params=None, headers=None, timeout=None):

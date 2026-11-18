@@ -100,6 +100,19 @@ class CDXAPIError(WaybackGapDetectorError):
     pass
 
 
+class ResumeKeyRequestError(CDXAPIError):
+    """A failed request in the sequential resumeKey fetch.
+
+    resume_key is the key of the failed request (None for the first request
+    of a fetch from the beginning). The caller logs it as the key to resume
+    from once the rows before it are stored.
+    """
+
+    def __init__(self, message: str, resume_key: str | None) -> None:
+        super().__init__(message)
+        self.resume_key = resume_key
+
+
 class InputFileError(WaybackGapDetectorError):
     """Input file related errors (not found, encoding issues, etc.)"""
 
@@ -645,7 +658,8 @@ def fetch_resumekey_rows(
 
     Ends normally only when a response carries no resumeKey. If the server
     repeats a resumeKey, raises CDXAPIError so that the caller does not
-    mark the partial result as complete.
+    mark the partial result as complete. A failed request raises
+    ResumeKeyRequestError, which carries the key to resume from.
     """
     api_url = "https://web.archive.org/cdx/search/cdx"
     params = _cdx_params(target_url, limit=limit, collapse=collapse)
@@ -669,10 +683,7 @@ def fetch_resumekey_rows(
             response = _get_with_retries(session, api_url, params, headers, timeout=60)
             data = response.json()
         except CDXAPIError as e:
-            failed_key = resume_key if resume_key else "(initial)"
-            logger.error(f"Failed at resumeKey={failed_key}. To resume, add:")
-            logger.error(f"  --resume-key {failed_key}")
-            raise CDXAPIError(f"CDX API fetch error: {e}") from e
+            raise ResumeKeyRequestError(f"CDX API fetch error: {e}", resume_key) from e
 
         if not isinstance(data, list):
             raise CDXAPIError(
@@ -756,7 +767,8 @@ def _store_resumekey_rows(
     Pending keys are flushed on every exit, including a failed request or
     Ctrl+C. The rows before the failed request were already fetched, so
     dropping them would leave a gap that resuming from the logged
-    resumeKey cannot fill.
+    resumeKey cannot fill. For the same reason, the resumeKey of a failed
+    request is logged only after the flush succeeded.
     """
     inserted = 0
     batch: list[str] = []
@@ -778,8 +790,12 @@ def _store_resumekey_rows(
                     insert_urls(conn, batch)
                     inserted += len(batch)
                     bar.update(len(batch))
-        except CDXAPIError:
+        except CDXAPIError as e:
             logger.error(f"Progress saved ({inserted} records).")
+            if isinstance(e, ResumeKeyRequestError):
+                failed_key = e.resume_key if e.resume_key else "(initial)"
+                logger.error(f"Failed at resumeKey={failed_key}. To resume, add:")
+                logger.error(f"  --resume-key {failed_key}")
             raise
     return inserted
 

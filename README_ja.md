@@ -102,7 +102,7 @@ python waygap.py "https://example.com/blog/*" \
 
 paginationモード（既定）は自動で再開します: 完了済みページはキャッシュDBに記録されるため、同じコマンドを再実行すれば未取得のページだけを取得します。手動での削除は不要です。キャッシュを意図的に一から作り直したい場合のみ `--refresh` を使います。
 
-`--resume-key` が必要になるのは `resumeKey` フォールバック経路（サーバがpagination非対応の場合）のみです。フォールバック実行が途中で失敗すると、ツールは `resumeKey` の値をログに出力するので、元のコマンドに追加して続行します:
+`--resume-key` が必要になるのは `resumeKey` フォールバック経路（サーバがpagination非対応の場合）のみです。フォールバック実行が途中で失敗すると、ツールは `resumeKey` の値をログに出力するので、元のコマンドに（`--refresh` を指定していた場合は外して）追加して続行します:
 
 ```bash
 python waygap.py "https://example.com/blog/*" \
