@@ -1043,12 +1043,17 @@ class TestResumeKeyCache(unittest.TestCase):
     def test_resume_hint_logged_after_rows_are_saved(self, mock_session_cls, _sleep):
         mock_session_cls.return_value.get.side_effect = self._route_fail_after_one_row
 
-        with self.assertLogs("waygap", level="INFO") as logs:
-            with self.assertRaises(CDXAPIError):
-                ensure_archived_db(TARGET, self.cache, workers=1)
+        with (
+            self.assertLogs("waygap", level="INFO") as logs,
+            patch(
+                "sys.argv",
+                ["waygap.py", TARGET, "--cache", self.cache, "--workers", "1"],
+            ),
+        ):
+            self.assertEqual(main(), 1)
 
         messages = [r.getMessage() for r in logs.records]
-        saved = messages.index("Progress saved (1 records).")
+        saved = messages.index("Fetched rows stored (1 records).")
         hint = messages.index("  --resume-key KEY1")
         self.assertLess(saved, hint)
 
@@ -1068,7 +1073,7 @@ class TestResumeKeyCache(unittest.TestCase):
 
         messages = [r.getMessage() for r in logs.records]
         self.assertFalse(any("--resume-key" in m for m in messages), messages)
-        self.assertFalse(any("Progress saved" in m for m in messages), messages)
+        self.assertFalse(any("Fetched rows stored" in m for m in messages), messages)
 
     @patch("requests.Session")
     def test_rows_before_an_interrupt_survive(self, mock_session_cls):
@@ -1217,6 +1222,32 @@ class TestMainResumeKeyOptions(unittest.TestCase):
                 main()
         mock_ensure.assert_not_called()
         return cm.exception.code
+
+    @patch("waygap.ensure_archived_db")
+    def test_failed_fetch_hint_matches_retained_progress(self, mock_ensure):
+        from waygap import ResumeKeyRequestError
+
+        cases = [
+            (None, [], False),
+            ("KEY1", [], True),
+            (None, ["--no-cache"], False),
+            ("KEY1", ["--no-cache"], False),
+        ]
+        for key, args, can_resume in cases:
+            with self.subTest(key=key, args=args):
+                mock_ensure.side_effect = ResumeKeyRequestError("request failed", key)
+                with (
+                    patch("sys.argv", ["waygap.py", TARGET, *args]),
+                    self.assertLogs("waygap", level="INFO") as logs,
+                ):
+                    self.assertEqual(main(), 1)
+                text = "\n".join(logs.output)
+                if can_resume:
+                    self.assertIn("--resume-key KEY1", text)
+                else:
+                    self.assertNotIn("--resume-key", text)
+                    self.assertIn("re-run the same command", text.lower())
+                self.assertNotIn("(initial)", text)
 
     def test_resume_key_with_no_cache_is_rejected(self):
         self.assertEqual(self._run_main("--resume-key", "KEY1", "--no-cache"), 2)
