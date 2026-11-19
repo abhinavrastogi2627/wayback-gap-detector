@@ -1379,7 +1379,10 @@ examples:
                     "Omit --no-cache on future runs to retain progress."
                 )
             elif e.resume_key:
-                logger.error(f"Failed at resumeKey={e.resume_key}. To resume, add:")
+                logger.error(
+                    f"Failed at resumeKey={e.resume_key}. "
+                    "To resume, remove --refresh if present and add:"
+                )
                 logger.error(f"  --resume-key {e.resume_key}")
             else:
                 logger.error("Re-run the same command to start from the beginning.")

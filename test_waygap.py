@@ -1230,6 +1230,7 @@ class TestMainResumeKeyOptions(unittest.TestCase):
         cases = [
             (None, [], False),
             ("KEY1", [], True),
+            ("KEY1", ["--refresh"], True),
             (None, ["--no-cache"], False),
             ("KEY1", ["--no-cache"], False),
         ]
@@ -1244,6 +1245,8 @@ class TestMainResumeKeyOptions(unittest.TestCase):
                 text = "\n".join(logs.output)
                 if can_resume:
                     self.assertIn("--resume-key KEY1", text)
+                    if "--refresh" in args:
+                        self.assertIn("remove --refresh", text.lower())
                 else:
                     self.assertNotIn("--resume-key", text)
                     self.assertIn("re-run the same command", text.lower())
