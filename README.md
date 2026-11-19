@@ -105,7 +105,8 @@ want to rebuild the cache from scratch.
 
 `--resume-key` is only needed for the `resumeKey` fallback path (used when the
 server does not support pagination). If a fallback run fails mid-way, the tool
-logs the `resumeKey` value — add it to your original command to continue:
+logs the `resumeKey` value — add it to your original command (without
+`--refresh`) to continue:
 
 ```bash
 python waygap.py "https://example.com/blog/*" \
@@ -114,6 +115,12 @@ python waygap.py "https://example.com/blog/*" \
   --limit 50000 \
   --resume-key "<RESUME_KEY>"
 ```
+
+`--resume-key` only continues an interrupted fallback fetch in the same cache:
+the cache file must exist, be incomplete, and have been built with the same
+target URL and options. Otherwise the tool stops with an error without
+deleting or overwriting the cache. It cannot be combined with `--no-cache` or
+`--refresh`.
 
 ---
 

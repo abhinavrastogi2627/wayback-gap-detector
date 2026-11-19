@@ -22,21 +22,25 @@ flowchart TD
 
     subgraph FETCH["CDX fetch phase"]
         ENSURE --> META{"meta check\ncompleted=1?"}
-        META -- "match + complete" --> REUSE["Reuse cache\nno API calls"]
-        META -- "mismatch" --> REBUILD["Rebuild DB"]
-        META -- "incomplete" --> RESUME["Resume missing pages"]
+        META -- "no --resume-key:\nmatch + complete\n(not an older resumeKey cache)" --> REUSE["Reuse cache\nno API calls"]
+        META -- "no --resume-key:\nmismatch" --> REBUILD["Rebuild DB"]
+        META -- "no --resume-key:\nmatch + incomplete, or resumeKey cache\ncompleted by an older version" --> RESUME["Resume missing pages"]
+        META -- "--resume-key: cache missing,\nmismatched, complete, or pagination" --> REJECT["CacheError\ncache not deleted or overwritten"]
+        META -- "--resume-key: match + incomplete,\nnot pagination" --> SEQ
         REBUILD --> NUM{"get_num_pages\nshowNumPages"}
         RESUME --> NUM
         NUM -- "page count available" --> PAR["fetch_page_rows × workers\n_fetch_pages_parallel\n(lenient: collapse=urlkey / strict: collapse=original)"]
-        NUM -- "unsupported" --> SEQ["fetch_resumekey_rows\nsequential + --resume-key"]
+        NUM -- "unsupported" --> SEQ["fetch_resumekey_rows\nsequential\n(repeated resumeKey → error, completed stays 0)"]
         PAR --> NORM["_rows_to_keys\nnormalize_key (surt)"]
-        SEQ --> NORM
         NORM --> INS["insert_urls\nINSERT OR IGNORE (key)"]
         INS --> DONE_PAGES["mark_page_done\nset_completed"]
+        SEQ --> STORE["_store_resumekey_rows\nnormalize_key + insert_urls\n(pending keys flushed on every exit)"]
+        STORE -- "generator ended normally" --> SEQ_DONE["set_completed"]
     end
 
     REUSE --> SCAN["scan_input_against_db\nstream input matching\n(keyed by normalize_key)"]
     DONE_PAGES --> SCAN
+    SEQ_DONE --> SCAN
 
     subgraph CHECK["Matching phase (low memory)"]
         SCAN --> BATCH["batch_lookup_found\n500 keys per WHERE IN query"]
@@ -49,7 +53,7 @@ flowchart TD
 
 | Table | Definition | Purpose |
 |---|---|---|
-| `meta` | `(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID` | Run parameters, `key_profile`, `completed` flag, `mode`, etc. Rebuilt automatically when parameters differ |
+| `meta` | `(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID` | Run parameters, `key_profile`, `completed` flag, `mode`, etc. Rebuilt automatically when parameters differ. `resumekey_v` (`RESUMEKEY_FETCH_VERSION`) is written when a resumeKey fallback fetch starts from the beginning; it is not part of the cache identity |
 | `archived` | `(key TEXT PRIMARY KEY) WITHOUT ROWID` | Set of surt keys only (`original` is not stored) |
 | `pages_done` | `(page INTEGER PRIMARY KEY)` | Fetched page numbers. On interruption, only missing pages are fetched again |
 
@@ -94,7 +98,7 @@ flowchart TD
 | `_get_with_retries(session, api_url, params, headers, timeout=60) -> Response` | GET with up to 3 retries, also detecting empty/non-JSON responses |
 | `get_num_pages(target_url, page_size, collapse, session, headers) -> int \| None` | Fetches the total page count via `showNumPages`. Sends the same `pageSize`/`collapse` as page fetches (the count must use the same query shape; returns `None` when unsupported) |
 | `fetch_page_rows(target_url, page, page_size, collapse, session, headers) -> list[list]` | Fetches one page (follows in-page resumeKey chaining when the server returns one; `limit` is not sent) |
-| `fetch_resumekey_rows(target_url, initial_resume_key, limit, collapse, session, headers) -> Generator` | Generator for sequential resumeKey fetching (`limit` is the chunk size; returns the last key via `return` on interruption) |
+| `fetch_resumekey_rows(target_url, initial_resume_key, limit, collapse, session, headers) -> Generator` | Generator for sequential resumeKey fetching (`limit` is the chunk size). Ends normally only when a response carries no resumeKey; a chunk with a resumeKey but no data rows is followed, and a repeated resumeKey raises `CDXAPIError`. A failed request raises `ResumeKeyRequestError` (a `CDXAPIError` subclass carrying the key of the failed request); it does not log the key itself |
 | `_rows_to_keys(rows, key_opts) -> list[str]` | Converts CDX rows (`fl=original`) into a list of surt keys (`original` spellings are not stored) |
 | `_fetch_pages_parallel(target_url, pages, page_size, key_opts, workers, headers, collapse) -> Generator[tuple[int, list[str]]]` | Fetches the given pages in a thread pool and yields `(page, keys)` as they complete |
 
@@ -102,10 +106,11 @@ flowchart TD
 
 | Signature | Description |
 |---|---|
-| `ensure_archived_db(target_url, cache_file, key_opts=None, initial_resume_key=None, limit=None, page_size=None, workers=4, refresh=False) -> str` | Determines reuse/resume/rebuild (including profile or column-layout mismatches) and builds the DB, returning its path. Sends `collapse=urlkey` for lenient / `collapse=original` for strict (with tqdm progress) |
+| `ensure_archived_db(target_url, cache_file, key_opts=None, initial_resume_key=None, limit=None, page_size=None, workers=4, refresh=False) -> str` | Determines reuse/resume/rebuild (including profile or column-layout mismatches) and builds the DB, returning its path. Sends `collapse=urlkey` for lenient / `collapse=original` for strict (with tqdm progress). With `initial_resume_key`, raises `CacheError` unless the cache file exists, matches the current settings, is incomplete, and is not a pagination cache. In the resumeKey path, sets `completed=1` only after the fetch reached the end. A completed `mode=resumekey` cache without the current `resumekey_v` (completed by an older version) is not reused: it is marked incomplete and fetched again from the beginning |
+| `_store_resumekey_rows(conn, rows, key_opts) -> int` | Inserts the keys of `fetch_resumekey_rows` rows in batches and returns the count. Pending keys are flushed on every exit (including errors and Ctrl+C). A resumeKey to continue from is logged only when a request fails (`ResumeKeyRequestError`) and only after the flush succeeded, so the rows before it are stored. If the flush fails, the `sqlite3` error propagates and no resumeKey is logged |
 | `count_input_lines(input_file: str) -> int \| None` | Counts total lines quickly for the `scan_input_against_db` progress bar (returns `None` on failure) |
 | `scan_input_against_db(input_file, db_path, key_opts=None, output_file=None, output_archived=None, batch_size=LOOKUP_BATCH_SIZE) -> tuple[int, int, int]` | Streams, keys, batch-queries, and incrementally writes the input, returning `(total, not archived, archived)` (production path) |
-| `main() -> int` | CLI entry point (argument parsing, `build_key_opts`, DB setup, matching, exit code) |
+| `main() -> int` | CLI entry point (argument parsing, `build_key_opts`, DB setup, matching, exit code). Rejects `--resume-key` combined with `--no-cache` or `--refresh` |
 
 ### Test and small-scale helpers
 

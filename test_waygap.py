@@ -9,8 +9,11 @@ Numeric-shaped hosts are covered explicitly (they are the only place
 where our keys intentionally diverge from surt's gethostbyname_ex path).
 """
 
+import contextlib
+import io
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -25,7 +28,10 @@ from waygap import (
     CDX_FILTER,
     CDX_FL,
     DB_SCHEMA_VERSION,
+    RESUMEKEY_FETCH_VERSION,
     USER_AGENT,
+    CacheError,
+    CDXAPIError,
     InputFileError,
     __version__,
     _cdx_params,
@@ -35,16 +41,19 @@ from waygap import (
     count_archived,
     detect_not_archived,
     ensure_archived_db,
+    expected_meta,
     extract_archived_urls,
     fetch_page_rows,
     fetch_resumekey_rows,
     get_num_pages,
     insert_urls,
     key_profile,
+    main,
     normalize_key,
     open_db,
     read_meta,
     scan_input_against_db,
+    write_meta,
 )
 
 
@@ -815,6 +824,406 @@ class TestFetchResumeKeyRows(unittest.TestCase):
         self.assertIsNone(last_key)
         self.assertEqual(mock_session.get.call_count, 1)
 
+    @patch("requests.Session")
+    def test_repeated_response_key_raises(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [
+            _json_response([["original"], ["http://a.example/"], [], ["KEY1"]]),
+            _json_response([["original"], ["http://b.example/"], [], ["KEY1"]]),
+        ]
+
+        with self.assertRaises(CDXAPIError):
+            _drain(
+                fetch_resumekey_rows(
+                    "http://example.com/*", None, None, None, mock_session, {}
+                )
+            )
+
+    @patch("requests.Session")
+    def test_request_side_cycle_raises(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.return_value = _json_response(
+            [["original"], ["http://a.example/"], [], ["KEY0"]]
+        )
+
+        with self.assertRaises(CDXAPIError):
+            _drain(
+                fetch_resumekey_rows(
+                    "http://example.com/*", "KEY0", None, None, mock_session, {}
+                )
+            )
+        self.assertEqual(mock_session.get.call_count, 1)
+
+    @patch("requests.Session")
+    def test_key_without_rows_is_followed(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [
+            _json_response([["original"], ["http://a.example/"], [], ["KEY1"]]),
+            _json_response([["original"], [], ["KEY2"]]),
+            _json_response([["original"], ["http://c.example/"]]),
+        ]
+
+        rows, _ = _drain(
+            fetch_resumekey_rows(
+                "http://example.com/*", None, None, None, mock_session, {}
+            )
+        )
+
+        self.assertEqual(rows, [["http://a.example/"], ["http://c.example/"]])
+        self.assertEqual(mock_session.get.call_count, 3)
+
+
+TARGET = "http://example.com/*"
+
+
+def _no_pagination_response():
+    """A showNumPages response that makes the fetch fall back to resumeKey."""
+    r = MagicMock()
+    r.raise_for_status.side_effect = requests.exceptions.HTTPError("400")
+    r.status_code = 400
+    return r
+
+
+def _no_network(url, params=None, headers=None, timeout=None):
+    raise AssertionError(f"unexpected request: {params}")
+
+
+class TestResumeKeyCache(unittest.TestCase):
+    """Tests that the resumeKey paths mark the cache complete only when done."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.cache = os.path.join(self.tmpdir, "cache.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_cache(
+        self,
+        target: str = TARGET,
+        completed: str = "0",
+        mode: str | None = "resumekey",
+        urls: tuple[str, ...] | list[str] = (),
+        marked: bool = False,
+    ):
+        conn = open_db(self.cache)
+        try:
+            meta = {**expected_meta(target, {}, None), "completed": completed}
+            if mode is not None:
+                meta["mode"] = mode
+            if marked:
+                meta["resumekey_v"] = RESUMEKEY_FETCH_VERSION
+            write_meta(conn, meta)
+            insert_urls(conn, [normalize_key(u) for u in urls])
+        finally:
+            conn.close()
+
+    def _state(self):
+        conn = sqlite3.connect(self.cache)
+        try:
+            keys = {r[0] for r in conn.execute("SELECT key FROM archived;")}
+            return keys, read_meta(conn)
+        finally:
+            conn.close()
+
+    @patch("requests.Session")
+    def test_fallback_repeated_key_leaves_cache_incomplete(self, mock_session_cls):
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _no_pagination_response()
+            if params.get("resumeKey") is None:
+                return _json_response(
+                    [["original"], ["http://a.example/"], [], ["KEY1"]]
+                )
+            return _json_response([["original"], ["http://b.example/"], [], ["KEY1"]])
+
+        mock_session_cls.return_value.get.side_effect = _route
+
+        with self.assertRaises(CDXAPIError):
+            ensure_archived_db(TARGET, self.cache, workers=1)
+
+        keys, meta = self._state()
+        self.assertEqual(meta.get("completed"), "0")
+        self.assertEqual(meta.get("mode"), "resumekey")
+        self.assertIn(normalize_key("http://a.example/"), keys)
+
+    @patch("requests.Session")
+    def test_fallback_key_without_rows_continues(self, mock_session_cls):
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _no_pagination_response()
+            key = params.get("resumeKey")
+            if key is None:
+                return _json_response(
+                    [["original"], ["http://a.example/"], [], ["KEY1"]]
+                )
+            if key == "KEY1":
+                return _json_response([["original"], [], ["KEY2"]])
+            if key == "KEY2":
+                return _json_response([["original"], ["http://c.example/"]])
+            raise AssertionError(f"unexpected params: {params}")
+
+        mock_session_cls.return_value.get.side_effect = _route
+
+        ensure_archived_db(TARGET, self.cache, workers=1)
+
+        keys, meta = self._state()
+        self.assertEqual(meta.get("completed"), "1")
+        self.assertEqual(
+            keys,
+            {normalize_key("http://a.example/"), normalize_key("http://c.example/")},
+        )
+
+    @patch("requests.Session")
+    def test_resume_key_cycle_leaves_cache_incomplete(self, mock_session_cls):
+        self._make_cache(urls=["http://a.example/"])
+        mock_session_cls.return_value.get.return_value = _json_response(
+            [["original"], ["http://b.example/"], [], ["KEY1"]]
+        )
+
+        with self.assertRaises(CDXAPIError):
+            ensure_archived_db(TARGET, self.cache, initial_resume_key="KEY1")
+
+        keys, meta = self._state()
+        self.assertEqual(meta.get("completed"), "0")
+        self.assertIn(normalize_key("http://b.example/"), keys)
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_rows_before_a_failure_survive_resume(self, mock_session_cls, _sleep):
+        def _route_fail(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _no_pagination_response()
+            if params.get("resumeKey") is None:
+                return _json_response(
+                    [["original"], ["http://a.example/"], [], ["KEY1"]]
+                )
+            raise requests.exceptions.ConnectionError("down")
+
+        mock_session_cls.return_value.get.side_effect = _route_fail
+        with self.assertRaises(CDXAPIError):
+            ensure_archived_db(TARGET, self.cache, workers=1)
+
+        keys, meta = self._state()
+        self.assertEqual(keys, {normalize_key("http://a.example/")})
+        self.assertEqual(meta.get("completed"), "0")
+        self.assertEqual(meta.get("resumekey_v"), RESUMEKEY_FETCH_VERSION)
+
+        def _route_resume(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if params.get("resumeKey") == "KEY1":
+                return _json_response([["original"], ["http://b.example/"]])
+            raise AssertionError(f"unexpected params: {params}")
+
+        mock_session_cls.return_value.get.side_effect = _route_resume
+        ensure_archived_db(TARGET, self.cache, initial_resume_key="KEY1")
+
+        keys, meta = self._state()
+        self.assertEqual(
+            keys,
+            {normalize_key("http://a.example/"), normalize_key("http://b.example/")},
+        )
+        self.assertEqual(meta.get("completed"), "1")
+        self.assertEqual(meta.get("resumekey_v"), RESUMEKEY_FETCH_VERSION)
+
+    @staticmethod
+    def _route_fail_after_one_row(url, params=None, headers=None, timeout=None):
+        params = params or {}
+        if "showNumPages" in params:
+            return _no_pagination_response()
+        if params.get("resumeKey") is None:
+            return _json_response([["original"], ["http://a.example/"], [], ["KEY1"]])
+        raise requests.exceptions.ConnectionError("down")
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_resume_hint_logged_after_rows_are_saved(self, mock_session_cls, _sleep):
+        mock_session_cls.return_value.get.side_effect = self._route_fail_after_one_row
+
+        with self.assertLogs("waygap", level="INFO") as logs:
+            with self.assertRaises(CDXAPIError):
+                ensure_archived_db(TARGET, self.cache, workers=1)
+
+        messages = [r.getMessage() for r in logs.records]
+        saved = messages.index("Progress saved (1 records).")
+        hint = messages.index("  --resume-key KEY1")
+        self.assertLess(saved, hint)
+
+    @patch("waygap.insert_urls", side_effect=sqlite3.OperationalError("disk full"))
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_no_resume_hint_when_saving_rows_fails(
+        self, mock_session_cls, _sleep, _insert
+    ):
+        # The rows before KEY1 are not stored, so resuming from KEY1 would
+        # leave them missing from a cache that is later marked complete.
+        mock_session_cls.return_value.get.side_effect = self._route_fail_after_one_row
+
+        with self.assertLogs("waygap", level="INFO") as logs:
+            with self.assertRaises(sqlite3.OperationalError):
+                ensure_archived_db(TARGET, self.cache, workers=1)
+
+        messages = [r.getMessage() for r in logs.records]
+        self.assertFalse(any("--resume-key" in m for m in messages), messages)
+        self.assertFalse(any("Progress saved" in m for m in messages), messages)
+
+    @patch("requests.Session")
+    def test_rows_before_an_interrupt_survive(self, mock_session_cls):
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _no_pagination_response()
+            if params.get("resumeKey") is None:
+                return _json_response(
+                    [["original"], ["http://a.example/"], [], ["KEY1"]]
+                )
+            raise KeyboardInterrupt
+
+        mock_session_cls.return_value.get.side_effect = _route
+        with self.assertRaises(KeyboardInterrupt):
+            ensure_archived_db(TARGET, self.cache, workers=1)
+
+        keys, meta = self._state()
+        self.assertEqual(keys, {normalize_key("http://a.example/")})
+        self.assertEqual(meta.get("completed"), "0")
+
+    @patch("requests.Session")
+    def test_legacy_completed_resumekey_cache_is_fetched_again(self, mock_session_cls):
+        self._make_cache(completed="1", urls=["http://a.example/"])
+
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _no_pagination_response()
+            if params.get("resumeKey") is None:
+                return _json_response([["original"], ["http://b.example/"]])
+            raise AssertionError(f"unexpected params: {params}")
+
+        mock_session_cls.return_value.get.side_effect = _route
+        ensure_archived_db(TARGET, self.cache, workers=1)
+
+        keys, meta = self._state()
+        self.assertEqual(
+            keys,
+            {normalize_key("http://a.example/"), normalize_key("http://b.example/")},
+        )
+        self.assertEqual(meta.get("completed"), "1")
+        self.assertEqual(meta.get("resumekey_v"), RESUMEKEY_FETCH_VERSION)
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_legacy_completed_resumekey_cache_stays_incomplete_on_failure(
+        self, mock_session_cls, _sleep
+    ):
+        self._make_cache(completed="1", urls=["http://a.example/"])
+
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _no_pagination_response()
+            raise requests.exceptions.ConnectionError("down")
+
+        mock_session_cls.return_value.get.side_effect = _route
+        with self.assertRaises(CDXAPIError):
+            ensure_archived_db(TARGET, self.cache, workers=1)
+
+        keys, meta = self._state()
+        self.assertEqual(keys, {normalize_key("http://a.example/")})
+        self.assertEqual(meta.get("completed"), "0")
+
+    @patch("requests.Session")
+    def test_marked_completed_resumekey_cache_is_reused(self, mock_session_cls):
+        self._make_cache(completed="1", urls=["http://a.example/"], marked=True)
+        mock_session_cls.return_value.get.side_effect = _no_network
+
+        ensure_archived_db(TARGET, self.cache)
+
+        keys, meta = self._state()
+        self.assertEqual(keys, {normalize_key("http://a.example/")})
+        self.assertEqual(meta.get("completed"), "1")
+
+    @patch("requests.Session")
+    def test_resume_key_without_cache_is_rejected(self, mock_session_cls):
+        mock_session_cls.return_value.get.side_effect = _no_network
+
+        with self.assertRaises(CacheError):
+            ensure_archived_db(TARGET, self.cache, initial_resume_key="KEY1")
+
+        self.assertFalse(os.path.exists(self.cache))
+
+    @patch("requests.Session")
+    def test_resume_key_with_other_settings_is_rejected(self, mock_session_cls):
+        self._make_cache(target="http://other.example/*", urls=["http://o.example/"])
+        mock_session_cls.return_value.get.side_effect = _no_network
+
+        with self.assertRaises(CacheError):
+            ensure_archived_db(TARGET, self.cache, initial_resume_key="KEY1")
+
+        keys, meta = self._state()
+        self.assertEqual(keys, {normalize_key("http://o.example/")})
+        self.assertEqual(meta.get("target_url"), "http://other.example/*")
+
+    @patch("requests.Session")
+    def test_resume_key_on_completed_cache_is_rejected(self, mock_session_cls):
+        self._make_cache(completed="1", urls=["http://a.example/"])
+        mock_session_cls.return_value.get.side_effect = _no_network
+
+        with self.assertRaises(CacheError):
+            ensure_archived_db(TARGET, self.cache, initial_resume_key="KEY1")
+
+        _, meta = self._state()
+        self.assertEqual(meta.get("completed"), "1")
+
+    @patch("requests.Session")
+    def test_resume_key_on_pagination_cache_is_rejected(self, mock_session_cls):
+        self._make_cache(mode="pagination")
+        mock_session_cls.return_value.get.side_effect = _no_network
+
+        with self.assertRaises(CacheError):
+            ensure_archived_db(TARGET, self.cache, initial_resume_key="KEY1")
+
+    @patch("requests.Session")
+    def test_resume_key_on_legacy_cache_without_mode(self, mock_session_cls):
+        self._make_cache(mode=None, urls=["http://a.example/"])
+        mock_session_cls.return_value.get.return_value = _json_response(
+            [["original"], ["http://b.example/"]]
+        )
+
+        ensure_archived_db(TARGET, self.cache, initial_resume_key="KEY1")
+
+        keys, meta = self._state()
+        self.assertEqual(meta.get("completed"), "1")
+        self.assertNotIn("resumekey_v", meta)
+        self.assertEqual(meta.get("mode"), "resumekey")
+        self.assertEqual(
+            keys,
+            {normalize_key("http://a.example/"), normalize_key("http://b.example/")},
+        )
+
+
+class TestMainResumeKeyOptions(unittest.TestCase):
+    """Tests for CLI option combinations with --resume-key."""
+
+    def _run_main(self, *args):
+        with (
+            patch("sys.argv", ["waygap.py", TARGET, *args]),
+            patch("waygap.ensure_archived_db") as mock_ensure,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit) as cm:
+                main()
+        mock_ensure.assert_not_called()
+        return cm.exception.code
+
+    def test_resume_key_with_no_cache_is_rejected(self):
+        self.assertEqual(self._run_main("--resume-key", "KEY1", "--no-cache"), 2)
+
+    def test_resume_key_with_refresh_is_rejected(self):
+        self.assertEqual(self._run_main("--resume-key", "KEY1", "--refresh"), 2)
+
 
 class TestCDXPaginationDB(unittest.TestCase):
     """Tests for pagination fetch into SQLite (mocked API)."""
@@ -1104,6 +1513,8 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestSQLiteCache))
     suite.addTests(loader.loadTestsFromTestCase(TestFetchPageRowsChaining))
     suite.addTests(loader.loadTestsFromTestCase(TestFetchResumeKeyRows))
+    suite.addTests(loader.loadTestsFromTestCase(TestResumeKeyCache))
+    suite.addTests(loader.loadTestsFromTestCase(TestMainResumeKeyOptions))
     suite.addTests(loader.loadTestsFromTestCase(TestCDXPaginationDB))
     suite.addTests(loader.loadTestsFromTestCase(TestVersion))
 
