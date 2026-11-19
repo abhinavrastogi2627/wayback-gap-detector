@@ -29,7 +29,7 @@ flowchart TD
         META -- "--resume-key: match + incomplete,\nnot pagination" --> SEQ
         REBUILD --> NUM{"get_num_pages\nshowNumPages"}
         RESUME --> NUM
-        NUM -- "page count available" --> PAR["fetch_page_rows × workers\n_fetch_pages_parallel\n(lenient: collapse=urlkey / strict: collapse=original)"]
+        NUM -- "page count available" --> PAR["fetch_page_rows × workers\n_fetch_pages_parallel\n(lenient: collapse=urlkey / strict: collapse=original)\n(shared 3 s request interval)"]
         NUM -- "unsupported" --> SEQ["fetch_resumekey_rows\nsequential\n(repeated resumeKey → error, completed stays 0)"]
         PAR --> NORM["_rows_to_keys\nnormalize_key (surt)"]
         NORM --> INS["insert_urls\nINSERT OR IGNORE (key)"]
@@ -91,12 +91,13 @@ flowchart TD
 
 | Signature | Description |
 |---|---|
+| `_RateLimiter(interval).wait() -> None` | Spaces calls at least `interval` seconds apart across threads (reserves a slot under a lock, sleeps outside it). The module-level `_CDX_LIMITER` uses `CDX_REQUEST_INTERVAL` (3.0 s) and is shared by every CDX request |
 | `make_session() -> requests.Session` | Creates a retrying `Session` (exponential backoff on 429/5xx) |
 | `_cdx_params(target_url, *, page=None, page_size=None, resume_key=None, limit=None, collapse=None) -> dict[str, Any]` | Builds request parameters shared by both fetch paths. `collapse` is `urlkey` for lenient and `original` for strict. `limit` is used only by the sequential resumeKey path |
 | `_split_resume_key(data: list) -> tuple[list, str \| None]` | Splits a trailing resumeKey off the raw response. Only the documented `[..., [], ["<resumeKey>"]]` pattern is recognised, so `fl=original` single-column data rows are never mistaken for it; callers remove empty rows only after this split |
 | `_strip_header(data: list) -> list` | Removes the header row (`urlkey`/`original`) at the start of a chunk |
-| `_get_with_retries(session, api_url, params, headers, timeout=60) -> Response` | GET with up to 3 retries, also detecting empty/non-JSON responses |
-| `get_num_pages(target_url, page_size, collapse, session, headers) -> int \| None` | Fetches the total page count via `showNumPages`. Sends the same `pageSize`/`collapse` as page fetches (the count must use the same query shape; returns `None` when unsupported) |
+| `_get_with_retries(session, api_url, params, headers, timeout=60) -> Response` | GET with up to 3 retries, also detecting empty/non-JSON responses. Calls `_CDX_LIMITER.wait()` before each attempt |
+| `get_num_pages(target_url, page_size, collapse, session, headers) -> int \| None` | Fetches the total page count via `showNumPages`. Sends the same `pageSize`/`collapse` as page fetches (the count must use the same query shape; returns `None` when unsupported). Calls `_CDX_LIMITER.wait()` before the request |
 | `fetch_page_rows(target_url, page, page_size, collapse, session, headers) -> list[list]` | Fetches one page (follows in-page resumeKey chaining when the server returns one; `limit` is not sent) |
 | `fetch_resumekey_rows(target_url, initial_resume_key, limit, collapse, session, headers) -> Generator` | Generator for sequential resumeKey fetching (`limit` is the chunk size). Ends normally only when a response carries no resumeKey; a chunk with a resumeKey but no data rows is followed, and a repeated resumeKey raises `CDXAPIError`. A failed request raises `ResumeKeyRequestError` (a `CDXAPIError` subclass carrying the key of the failed request); it does not log the key itself |
 | `_rows_to_keys(rows, key_opts) -> list[str]` | Converts CDX rows (`fl=original`) into a list of surt keys (`original` spellings are not stored) |
@@ -106,7 +107,7 @@ flowchart TD
 
 | Signature | Description |
 |---|---|
-| `ensure_archived_db(target_url, cache_file, key_opts=None, initial_resume_key=None, limit=None, page_size=None, workers=4, refresh=False) -> str` | Determines reuse/resume/rebuild (including profile or column-layout mismatches) and builds the DB, returning its path. Sends `collapse=urlkey` for lenient / `collapse=original` for strict (with tqdm progress). With `initial_resume_key`, raises `CacheError` unless the cache file exists, matches the current settings, is incomplete, and is not a pagination cache. In the resumeKey path, sets `completed=1` only after the fetch reached the end. A completed `mode=resumekey` cache without the current `resumekey_v` (completed by an older version) is not reused: it is marked incomplete and fetched again from the beginning |
+| `ensure_archived_db(target_url, cache_file, key_opts=None, initial_resume_key=None, limit=None, page_size=None, workers=2, refresh=False) -> str` | Determines reuse/resume/rebuild (including profile or column-layout mismatches) and builds the DB, returning its path. Sends `collapse=urlkey` for lenient / `collapse=original` for strict (with tqdm progress). With `initial_resume_key`, raises `CacheError` unless the cache file exists, matches the current settings, is incomplete, and is not a pagination cache. In the resumeKey path, sets `completed=1` only after the fetch reached the end. A completed `mode=resumekey` cache without the current `resumekey_v` (completed by an older version) is not reused: it is marked incomplete and fetched again from the beginning |
 | `_store_resumekey_rows(conn, rows, key_opts) -> int` | Inserts the keys of `fetch_resumekey_rows` rows in batches and returns the count. Pending keys are flushed on every exit (including errors and Ctrl+C). A resumeKey to continue from is logged only when a request fails (`ResumeKeyRequestError`) and only after the flush succeeded, so the rows before it are stored. If the flush fails, the `sqlite3` error propagates and no resumeKey is logged |
 | `count_input_lines(input_file: str) -> int \| None` | Counts total lines quickly for the `scan_input_against_db` progress bar (returns `None` on failure) |
 | `scan_input_against_db(input_file, db_path, key_opts=None, output_file=None, output_archived=None, batch_size=LOOKUP_BATCH_SIZE) -> tuple[int, int, int]` | Streams, keys, batch-queries, and incrementally writes the input, returning `(total, not archived, archived)` (production path) |

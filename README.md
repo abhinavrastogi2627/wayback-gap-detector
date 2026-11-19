@@ -65,7 +65,7 @@ python waygap.py TARGET_URL [OPTIONS]
 | `--refresh` | — | Ignore and rebuild the existing cache |
 | `--no-cache` | — | Use a temporary database (do not reuse or keep) |
 | `--page-size N` | *(server default)* | CDX pagination page size (on web.archive.org the default is 1 zipnum block per page) |
-| `--workers N` | `4` | Parallel page fetch workers |
+| `--workers N` | `2` | Parallel page fetch workers (requests are capped at one every 3 s across all workers) |
 | `--batch-size N` | `500` | URL lookup batch size for DB scan |
 | `--output-archived [FILE]` | `archived.txt` | Also write archived URLs (the matched local input lines) to a file |
 | `--resume-key KEY` | *(none)* | Resume an interrupted `resumeKey` fallback fetch (pagination mode resumes automatically) |
