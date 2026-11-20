@@ -67,7 +67,7 @@ python waygap.py TARGET_URL [OPTIONS]
 | `--refresh` | — | 既存キャッシュを無視して再構築 |
 | `--no-cache` | — | 一時DBを使用（キャッシュを再利用も保持もしない） |
 | `--page-size N` | *(サーバ既定値)* | CDX paginationのページサイズ（web.archive.org の既定は1ブロック/ページ） |
-| `--workers N` | `4` | 並列ページ取得のワーカー数 |
+| `--workers N` | `2` | 並列ページ取得のワーカー数（リクエストは全ワーカー合計で3秒に1回までに制限） |
 | `--batch-size N` | `500` | DB照合時のURL照会バッチサイズ |
 | `--output-archived [FILE]` | `archived.txt` | アーカイブ済みURL（照合された手元入力行）もファイルに書き出す |
 | `--resume-key KEY` | *(なし)* | 中断した `resumeKey` フォールバック取得を再開（paginationモードは自動再開） |

@@ -19,15 +19,18 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 from surt import surt as upstream_surt
 
+import waygap
 from waygap import (
     CDX_COLLAPSE,
     CDX_COLLAPSE_STRICT,
     CDX_FILTER,
     CDX_FL,
     DB_SCHEMA_VERSION,
+    DEFAULT_WORKERS,
     RESUMEKEY_FETCH_VERSION,
     USER_AGENT,
     CacheError,
@@ -35,6 +38,8 @@ from waygap import (
     InputFileError,
     __version__,
     _cdx_params,
+    _get_with_retries,
+    _RateLimiter,
     _split_resume_key,
     archived_columns,
     build_key_opts,
@@ -68,6 +73,12 @@ def _json_response(payload):
     m.json.return_value = payload
     m.raise_for_status.return_value = None
     return m
+
+
+@pytest.fixture(autouse=True)
+def _no_cdx_throttle(monkeypatch):
+    """Disable the CDX request interval so tests do not sleep."""
+    monkeypatch.setattr(waygap, "_CDX_LIMITER", _RateLimiter(0))
 
 
 class TestBuildKeyOpts(unittest.TestCase):
@@ -699,6 +710,57 @@ class TestSQLiteCache(unittest.TestCase):
                 os.unlink(db_path)
 
 
+class TestCdxRateLimiter(unittest.TestCase):
+    """Tests for the CDX request interval shared by all threads."""
+
+    @patch("waygap.time.sleep")
+    @patch("waygap.time.monotonic")
+    def test_wait_spaces_calls_by_interval(self, mock_monotonic, mock_sleep):
+        limiter = _RateLimiter(3.0)
+        mock_monotonic.return_value = 100.0
+
+        limiter.wait()
+        mock_sleep.assert_not_called()
+
+        limiter.wait()
+        mock_sleep.assert_called_once_with(3.0)
+
+    @patch("waygap.time.sleep")
+    @patch("waygap.time.monotonic")
+    def test_wait_does_not_sleep_after_reserved_time(self, mock_monotonic, mock_sleep):
+        limiter = _RateLimiter(3.0)
+        mock_monotonic.return_value = 100.0
+        limiter.wait()
+
+        mock_monotonic.return_value = 104.0
+        limiter.wait()
+
+        mock_sleep.assert_not_called()
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_get_with_retries_waits_before_each_attempt(self, mock_session_cls, _sleep):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [
+            requests.exceptions.ConnectionError("reset"),
+            _json_response([["original"]]),
+        ]
+        with patch("waygap._CDX_LIMITER") as mock_limiter:
+            _get_with_retries(mock_session, "https://example.invalid/", {}, {})
+
+        self.assertEqual(mock_session.get.call_count, 2)
+        self.assertEqual(mock_limiter.wait.call_count, 2)
+
+    @patch("requests.Session")
+    def test_get_num_pages_waits_before_request(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.return_value = _json_response(5)
+        with patch("waygap._CDX_LIMITER") as mock_limiter:
+            get_num_pages("http://example.com/*", None, CDX_COLLAPSE, mock_session, {})
+
+        mock_limiter.wait.assert_called_once_with()
+
+
 class TestFetchPageRowsChaining(unittest.TestCase):
     """Tests for in-page resumeKey chaining without a hard iteration cap."""
 
@@ -1270,6 +1332,23 @@ class TestMainResumeKeyOptions(unittest.TestCase):
 
     def test_resume_key_with_refresh_is_rejected(self):
         self.assertEqual(self._run_main("--resume-key", "KEY1", "--refresh"), 2)
+
+
+class TestMainWorkersDefault(unittest.TestCase):
+    """Tests for the default --workers value passed to ensure_archived_db."""
+
+    def test_default_workers_is_two(self):
+        with (
+            patch("sys.argv", ["waygap.py", TARGET]),
+            patch(
+                "waygap.ensure_archived_db", side_effect=CacheError("stop")
+            ) as mock_ensure,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            main()
+
+        self.assertEqual(DEFAULT_WORKERS, 2)
+        self.assertEqual(mock_ensure.call_args.kwargs["workers"], 2)
 
 
 class TestCDXPaginationDB(unittest.TestCase):

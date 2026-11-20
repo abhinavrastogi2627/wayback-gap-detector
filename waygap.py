@@ -83,6 +83,14 @@ CDX_COLLAPSE_STRICT = "original"
 # The `timestamp` column may be added in a future schema version
 # if time-based features are ever needed.
 CDX_FL = "original"
+# Minimum seconds between the starts of two CDX requests, shared by all
+# threads. The CDX search API is limited to about 24 requests per minute
+# (per the `wayback` library v0.5.1, 2026-06); 3 s (20 per minute, ~83%
+# of the limit) leaves headroom for retries.
+CDX_REQUEST_INTERVAL = 3.0
+# Page fetch workers. The request rate is set by CDX_REQUEST_INTERVAL, so
+# workers only hide response latency; 2 keep the interval filled.
+DEFAULT_WORKERS = 2
 
 
 # ========================================
@@ -432,6 +440,31 @@ def batch_lookup_found(conn: sqlite3.Connection, keys: list[str]) -> set[str]:
 # ========================================
 # CDX API
 # ========================================
+class _RateLimiter:
+    """Spaces calls to wait() at least `interval` seconds apart across threads.
+
+    Each caller reserves the next free slot under the lock and sleeps
+    outside it, so a waiting thread does not block the others.
+    """
+
+    def __init__(self, interval: float) -> None:
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next)
+            self._next = start + self._interval
+        delay = start - now
+        if delay > 0:
+            time.sleep(delay)
+
+
+_CDX_LIMITER = _RateLimiter(CDX_REQUEST_INTERVAL)
+
+
 def make_session() -> requests.Session:
     session = requests.Session()
     retry = Retry(
@@ -488,6 +521,7 @@ def _get_with_retries(
     last_error: Exception | None = None
     for attempt in range(3):
         try:
+            _CDX_LIMITER.wait()
             response = session.get(
                 api_url, params=params, headers=headers, timeout=timeout
             )
@@ -547,6 +581,7 @@ def get_num_pages(
     if collapse:
         params["collapse"] = collapse
     try:
+        _CDX_LIMITER.wait()
         response = session.get(api_url, params=params, headers=headers, timeout=60)
         response.raise_for_status()
         text = response.text.strip()
@@ -803,7 +838,7 @@ def ensure_archived_db(
     initial_resume_key: str | None = None,
     limit: int | None = None,
     page_size: int | None = None,
-    workers: int = 4,
+    workers: int = DEFAULT_WORKERS,
     refresh: bool = False,
 ) -> str:
     """Build (or reuse/resume) the SQLite archived-URL cache. Returns db path.
@@ -1289,8 +1324,8 @@ examples:
         "--workers",
         dest="workers",
         type=int,
-        default=4,
-        help="parallel page fetch workers (default: 4)",
+        default=DEFAULT_WORKERS,
+        help=f"parallel page fetch workers (default: {DEFAULT_WORKERS})",
     )
     parser.add_argument(
         "--batch-size",
