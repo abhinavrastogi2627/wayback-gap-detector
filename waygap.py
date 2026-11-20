@@ -968,7 +968,7 @@ def ensure_archived_db(
             f"Fetching data from CDX API: {target_url} ({num_pages} pages, {len(pending)} pending)"
         )
         write_meta(conn, {"mode": "pagination", "num_pages": str(num_pages)})
-        total_inserted = 0
+        archived_count = count_archived(conn)
         with tqdm(total=len(pending), desc="Fetching pages", unit="page") as bar:
             for page, keys in _fetch_pages_parallel(
                 target_url,
@@ -980,11 +980,12 @@ def ensure_archived_db(
                 collapse,
             ):
                 if keys:
+                    changes_before = conn.total_changes
                     insert_urls(conn, keys)
-                    total_inserted += len(keys)
+                    archived_count += conn.total_changes - changes_before
                 mark_page_done(conn, page)
                 bar.update(1)
-                bar.set_postfix(records=count_archived(conn))
+                bar.set_postfix(records=archived_count)
         set_completed(conn, True)
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
         logger.info(
