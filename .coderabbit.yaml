@@ -3,7 +3,7 @@
 language: "en-US"
 
 # Max 250 characters.
-tone_instructions: "Be concise. Always explain why an issue matters and label its severity (high/medium/low)."
+tone_instructions: "Be concise. Always explain why an issue matters and what could break."
 
 early_access: false
 
@@ -12,6 +12,7 @@ reviews:
   profile: "chill"
 
   high_level_summary: false
+  suggested_reviewers: false
   poem: false
   review_status: true
   collapse_walkthrough: true
