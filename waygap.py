@@ -801,9 +801,9 @@ def _store_resumekey_rows(
 
     Pending keys are flushed on every exit, including a failed request or
     Ctrl+C. The rows before the failed request were already fetched, so
-    dropping them would leave a gap that resuming from the logged
-    resumeKey cannot fill. For the same reason, the resumeKey of a failed
-    request is logged only after the flush succeeded.
+    dropping them would leave a gap that resuming from the failed request's
+    resumeKey cannot fill. The request error propagates only after the flush
+    succeeds, so the CLI can safely choose an appropriate recovery hint.
     """
     inserted = 0
     batch: list[str] = []
@@ -825,12 +825,8 @@ def _store_resumekey_rows(
                     insert_urls(conn, batch)
                     inserted += len(batch)
                     bar.update(len(batch))
-        except CDXAPIError as e:
-            logger.error(f"Progress saved ({inserted} records).")
-            if isinstance(e, ResumeKeyRequestError):
-                failed_key = e.resume_key if e.resume_key else "(initial)"
-                logger.error(f"Failed at resumeKey={failed_key}. To resume, add:")
-                logger.error(f"  --resume-key {failed_key}")
+        except CDXAPIError:
+            logger.error(f"Fetched rows stored ({inserted} records).")
             raise
     return inserted
 
@@ -1411,6 +1407,20 @@ examples:
 
     except CDXAPIError as e:
         logger.error(f"{e}")
+        if isinstance(e, ResumeKeyRequestError):
+            if temp_db is not None:
+                logger.error(
+                    "Re-run the same command to start from the beginning. "
+                    "Omit --no-cache on future runs to retain progress."
+                )
+            elif e.resume_key:
+                logger.error(
+                    f"Failed at resumeKey={e.resume_key}. "
+                    "To resume, remove --refresh if present and add:"
+                )
+                logger.error(f"  --resume-key {e.resume_key}")
+            else:
+                logger.error("Re-run the same command to start from the beginning.")
         return 1
     except InputFileError as e:
         logger.error(f"{e}")

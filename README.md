@@ -122,6 +122,11 @@ target URL and options. Otherwise the tool stops with an error without
 deleting or overwriting the cache. It cannot be combined with `--no-cache` or
 `--refresh`.
 
+If the first fallback request fails before receiving a resume key, re-run the
+same command to start from the beginning. With `--no-cache`, the temporary
+database is deleted when the run ends, so re-running also starts from the
+beginning. Omit `--no-cache` on future runs to retain progress.
+
 ---
 
 ## Input file format
