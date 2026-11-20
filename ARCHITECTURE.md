@@ -112,6 +112,11 @@ flowchart TD
 | `scan_input_against_db(input_file, db_path, key_opts=None, output_file=None, output_archived=None, batch_size=LOOKUP_BATCH_SIZE) -> tuple[int, int, int]` | Streams, keys, batch-queries, and incrementally writes the input, returning `(total, not archived, archived)` (production path) |
 | `main() -> int` | CLI entry point (argument parsing, `build_key_opts`, DB setup, matching, exit code). Rejects `--resume-key` combined with `--no-cache` or `--refresh` |
 
+Pagination progress reads the existing archived count once before fetching, then
+adds the `conn.total_changes` delta around each `insert_urls()` call. This counts
+only new keys (not duplicates or page metadata writes), including when resuming
+an incomplete cache. The final success log reads the count once more.
+
 ### Test and small-scale helpers
 
 | Signature | Description |

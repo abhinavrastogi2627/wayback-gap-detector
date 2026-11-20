@@ -1274,6 +1274,107 @@ class TestCDXPaginationDB(unittest.TestCase):
             if os.path.exists(cache_path):
                 os.unlink(cache_path)
 
+    @patch(
+        "waygap.concurrent.futures.as_completed",
+        side_effect=lambda futures: iter(futures),
+    )
+    @patch("requests.Session")
+    def test_pagination_progress_counts_unique_rows_without_per_page_counts(
+        self, mock_session_cls, _as_completed
+    ):
+        pages = [
+            [["original"], ["http://a.example/"], ["http://a.example/"]],
+            [["original"], ["http://a.example/"], ["http://b.example/"]],
+            [["original"]],
+        ]
+
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _json_response(len(pages))
+            return _json_response(pages[params["page"]])
+
+        mock_session_cls.return_value.get.side_effect = _route
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                cache_path = os.path.join(tmp, "cache.db")
+                if existing:
+                    conn = open_db(cache_path)
+                    try:
+                        write_meta(
+                            conn,
+                            {
+                                **expected_meta(TARGET, {}, None),
+                                "completed": "0",
+                                "mode": "pagination",
+                            },
+                        )
+                        insert_urls(conn, [normalize_key("http://a.example/")])
+                    finally:
+                        conn.close()
+
+                with (
+                    patch("waygap.count_archived", wraps=count_archived) as count,
+                    patch("waygap.tqdm") as progress,
+                    self.assertLogs("waygap", level="INFO") as logs,
+                ):
+                    ensure_archived_db(TARGET, cache_path, workers=1)
+
+                bar = progress.return_value.__enter__.return_value
+                self.assertEqual(
+                    [call.kwargs["records"] for call in bar.set_postfix.call_args_list],
+                    [1, 2, 2],
+                )
+                self.assertEqual(count.call_count, 2)
+                self.assertIn(
+                    "All pages fetched successfully (2 unique URLs)",
+                    [record.getMessage() for record in logs.records],
+                )
+
+    @patch(
+        "waygap.concurrent.futures.as_completed",
+        side_effect=lambda futures: iter(futures),
+    )
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_pagination_progress_resumes_after_failed_page(
+        self, mock_session_cls, _sleep, _as_completed
+    ):
+        # Consume futures in page order so page 0 is persisted before page 1 fails.
+        fail = True
+        requested_pages = []
+
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _json_response(2)
+            page = params["page"]
+            requested_pages.append(page)
+            if page == 0:
+                return _json_response([["original"], ["http://a.example/"]])
+            if fail:
+                raise requests.exceptions.ConnectionError("down")
+            return _json_response(
+                [["original"], ["http://a.example/"], ["http://b.example/"]]
+            )
+
+        mock_session_cls.return_value.get.side_effect = _route
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = os.path.join(tmp, "cache.db")
+            with self.assertRaises(CDXAPIError):
+                ensure_archived_db(TARGET, cache_path, workers=1)
+            fail = False
+            requested_pages.clear()
+            with (
+                patch("waygap.count_archived", wraps=count_archived) as count,
+                patch("waygap.tqdm") as progress,
+            ):
+                ensure_archived_db(TARGET, cache_path, workers=1)
+            self.assertEqual(requested_pages, [1])
+            bar = progress.return_value.__enter__.return_value
+            bar.set_postfix.assert_called_once_with(records=2)
+            self.assertEqual(count.call_count, 2)
+
     @patch("requests.Session")
     def test_pagination_strict_uses_original_collapse(self, mock_session_cls):
         def _route(url, params=None, headers=None, timeout=None):
