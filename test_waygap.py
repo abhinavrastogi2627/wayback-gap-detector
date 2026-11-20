@@ -1067,13 +1067,26 @@ class TestResumeKeyCache(unittest.TestCase):
         # leave them missing from a cache that is later marked complete.
         mock_session_cls.return_value.get.side_effect = self._route_fail_after_one_row
 
-        with self.assertLogs("waygap", level="INFO") as logs:
-            with self.assertRaises(sqlite3.OperationalError):
-                ensure_archived_db(TARGET, self.cache, workers=1)
+        with (
+            self.assertLogs("waygap", level="INFO") as logs,
+            patch(
+                "sys.argv",
+                ["waygap.py", TARGET, "--cache", self.cache, "--workers", "1"],
+            ),
+        ):
+            self.assertEqual(main(), 1)
 
+        _insert.assert_called_once()
+        self.assertEqual(
+            _insert.call_args.args[1], [normalize_key("http://a.example/")]
+        )
         messages = [r.getMessage() for r in logs.records]
+        self.assertIn("Unexpected error: disk full", messages)
         self.assertFalse(any("--resume-key" in m for m in messages), messages)
         self.assertFalse(any("Fetched rows stored" in m for m in messages), messages)
+        keys, meta = self._state()
+        self.assertEqual(keys, set())
+        self.assertEqual(meta.get("completed"), "0")
 
     @patch("requests.Session")
     def test_rows_before_an_interrupt_survive(self, mock_session_cls):
