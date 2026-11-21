@@ -964,6 +964,8 @@ def ensure_archived_db(
             # told apart from a pagination cache when --resume-key is used.
             # resumekey_v marks a fetch that started from the beginning with
             # this version; a --resume-key run keeps the cache's marker as is.
+            # A previous checkpoint cannot verify progress in this new fetch.
+            conn.execute("DELETE FROM meta WHERE k='resume_key';")
             write_meta(
                 conn,
                 {

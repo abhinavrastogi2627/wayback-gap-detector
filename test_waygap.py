@@ -1359,6 +1359,8 @@ class TestResumeKeyCache(unittest.TestCase):
     def test_resume_key_without_checkpoint_is_rejected(self, mock_session_cls):
         for mode in (None, "resumekey"):
             with self.subTest(mode=mode):
+                if os.path.exists(self.cache):
+                    os.remove(self.cache)
                 self._make_cache(mode=mode, urls=["http://a.example/"])
                 before = self._state()
                 mock_session_cls.return_value.get.side_effect = _no_network
@@ -1416,6 +1418,42 @@ class TestResumeKeyCache(unittest.TestCase):
         )
         self.assertEqual(meta.get("resume_key"), "KEY2")
         self.assertEqual(meta.get("completed"), "0")
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_restart_invalidates_old_checkpoint_before_first_request(
+        self, mock_session_cls, _sleep
+    ):
+        self._make_cache(urls=["http://a.example/"], resume_key="KEY1")
+        conn = open_db(self.cache)
+        try:
+            write_meta(conn, {"resumekey_v": "2"})
+        finally:
+            conn.close()
+
+        def route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _no_pagination_response()
+            self.assertNotIn("resumeKey", params)
+            raise requests.exceptions.ConnectionError("down")
+
+        mock_session_cls.return_value.get.side_effect = route
+        with self.assertRaises(CDXAPIError):
+            ensure_archived_db(TARGET, self.cache)
+
+        keys, meta = self._state()
+        self.assertEqual(keys, {normalize_key("http://a.example/")})
+        self.assertEqual(meta.get("completed"), "0")
+        self.assertEqual(meta.get("resumekey_v"), RESUMEKEY_FETCH_VERSION)
+        self.assertNotIn("resume_key", meta)
+
+        mock_session_cls.reset_mock()
+        mock_session_cls.return_value.get.side_effect = _no_network
+        with self.assertRaisesRegex(CacheError, "no verified saved resume key"):
+            ensure_archived_db(TARGET, self.cache, initial_resume_key="KEY1")
+        self.assertEqual(self._state(), (keys, meta))
+        mock_session_cls.assert_not_called()
 
     @patch("requests.Session")
     def test_legacy_cache_can_restart_without_resume_key(self, mock_session_cls):

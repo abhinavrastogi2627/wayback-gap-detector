@@ -54,7 +54,7 @@ flowchart TD
 
 | Table | Definition | Purpose |
 |---|---|---|
-| `meta` | `(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID` | Run parameters, `key_profile`, `completed` flag, `mode`, `resume_key`, etc. Rebuilt automatically when parameters differ. `resumekey_v` (`RESUMEKEY_FETCH_VERSION`) is written when a resumeKey fallback fetch starts from the beginning; it is not part of the cache identity |
+| `meta` | `(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID` | Run parameters, `key_profile`, `completed` flag, `mode`, `resume_key`, etc. Rebuilt automatically when parameters differ. When a resumeKey fallback fetch starts from the beginning, any saved `resume_key` is cleared before `resumekey_v` (`RESUMEKEY_FETCH_VERSION`) is written; verified manual resumes preserve their checkpoint. `resumekey_v` is not part of the cache identity |
 | `archived` | `(key TEXT PRIMARY KEY) WITHOUT ROWID` | Set of surt keys only (`original` is not stored) |
 | `pages_done` | `(page INTEGER PRIMARY KEY)` | Fetched page numbers. On interruption, only missing pages are fetched again |
 
