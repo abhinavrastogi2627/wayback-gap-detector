@@ -91,6 +91,10 @@ CDX_REQUEST_INTERVAL = 3.0
 # Page fetch workers. The request rate is set by CDX_REQUEST_INTERVAL, so
 # workers only hide response latency; 2 keep the interval filled.
 DEFAULT_WORKERS = 2
+# Seconds between checks while waiting for page fetches. Windows delivers
+# Ctrl+C to a waiting main thread only when its wait returns, so the wait
+# for completed pages is split into polls of this length.
+FETCH_POLL_INTERVAL = 0.5
 
 
 # ========================================
@@ -131,6 +135,15 @@ class CacheError(WaybackGapDetectorError):
     """Local cache (SQLite) related errors"""
 
     pass
+
+
+class _FetchCancelled(Exception):
+    """Raised in a page fetch worker after the fetch was stopped.
+
+    Internal: the consumer has already stopped reading results, so this
+    never reaches the caller. Not a CDXAPIError, so it is not reported or
+    wrapped as a request failure.
+    """
 
 
 # ========================================
@@ -440,6 +453,18 @@ def batch_lookup_found(conn: sqlite3.Connection, keys: list[str]) -> set[str]:
 # ========================================
 # CDX API
 # ========================================
+def _pause(seconds: float, stop: threading.Event | None) -> None:
+    """Sleep for `seconds`, waking early when `stop` is set.
+
+    Raises _FetchCancelled if `stop` is set. Without `stop` this is a plain
+    time.sleep().
+    """
+    if stop is None:
+        time.sleep(seconds)
+    elif stop.wait(seconds):
+        raise _FetchCancelled
+
+
 class _RateLimiter:
     """Spaces calls to wait() at least `interval` seconds apart across threads.
 
@@ -452,14 +477,15 @@ class _RateLimiter:
         self._lock = threading.Lock()
         self._next = 0.0
 
-    def wait(self) -> None:
+    def wait(self, stop: threading.Event | None = None) -> None:
+        """Wait for the next slot; raises _FetchCancelled if `stop` is set."""
         with self._lock:
             now = time.monotonic()
             start = max(now, self._next)
             self._next = start + self._interval
         delay = start - now
         if delay > 0:
-            time.sleep(delay)
+            _pause(delay, stop)
 
 
 _CDX_LIMITER = _RateLimiter(CDX_REQUEST_INTERVAL)
@@ -516,15 +542,24 @@ def _get_with_retries(
     params: dict,
     headers: dict,
     timeout: int = 60,
+    stop: threading.Event | None = None,
 ) -> requests.Response:
-    """GET with retries for transport errors and non-JSON/empty 200 responses."""
+    """GET with retries for transport errors and non-JSON/empty 200 responses.
+
+    Once `stop` is set, raises _FetchCancelled instead of sending, retrying
+    or logging. A request already in progress is not interrupted.
+    """
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            _CDX_LIMITER.wait()
+            _CDX_LIMITER.wait(stop)
+            if stop is not None and stop.is_set():
+                raise _FetchCancelled
             response = session.get(
                 api_url, params=params, headers=headers, timeout=timeout
             )
+            if stop is not None and stop.is_set():
+                raise _FetchCancelled
             response.raise_for_status()
             content_type = response.headers.get("Content-Type", "")
             body = response.content
@@ -539,17 +574,19 @@ def _get_with_retries(
                     f"content-length={len(body)}"
                 )
                 if attempt < 2:
-                    time.sleep(2**attempt)
+                    _pause(2**attempt, stop)
                     continue
                 raise CDXAPIError("Non-JSON or empty response (max retries reached)")
             return response
         except CDXAPIError:
             raise
         except requests.exceptions.RequestException as e:
+            if stop is not None and stop.is_set():
+                raise _FetchCancelled from e
             last_error = e
             logger.warning(f"Request error (attempt {attempt + 1}/3): {e}")
             if attempt < 2:
-                time.sleep(2**attempt)
+                _pause(2**attempt, stop)
                 continue
     raise CDXAPIError(
         f"CDX API fetch error (max retries reached): {last_error}"
@@ -638,8 +675,12 @@ def fetch_page_rows(
     collapse: str | None,
     session: requests.Session,
     headers: dict,
+    stop: threading.Event | None = None,
 ) -> list[list]:
     """Fetch one page (following in-page resumeKey chaining). Returns data rows.
+
+    `stop` is passed to _get_with_retries(): once it is set, the fetch
+    raises _FetchCancelled instead of sending further requests.
 
     NOTE: `limit` is intentionally NOT sent here. In pagination mode the
     server defines page boundaries, so `limit` would only truncate each page
@@ -664,7 +705,7 @@ def fetch_page_rows(
                 break
             seen_keys.add(resume_key)
             params["resumeKey"] = resume_key
-        response = _get_with_retries(session, api_url, params, headers)
+        response = _get_with_retries(session, api_url, params, headers, stop=stop)
         data = response.json()
         if not isinstance(data, list):
             raise CDXAPIError(
@@ -771,8 +812,16 @@ def _fetch_pages_parallel(
     headers: dict,
     collapse: str | None,
 ) -> Generator[tuple[int, list[str]], None, None]:
-    """Fetch pages concurrently; yields (page, surt_keys) as they complete."""
+    """Fetch pages concurrently; yields (page, surt_keys) as they complete.
+
+    Pages completed in the same wait are yielded in page order, and a
+    failed page among them is raised after the successful ones. When the
+    generator exits early (failed page, close(), Ctrl+C), queued pages are
+    cancelled and the workers are told to stop; requests already in
+    progress are not interrupted.
+    """
     thread_state = threading.local()
+    stop = threading.Event()
 
     def _get_session() -> requests.Session:
         sess = getattr(thread_state, "session", None)
@@ -783,13 +832,40 @@ def _fetch_pages_parallel(
 
     def _work(page: int) -> tuple[int, list[str]]:
         sess = _get_session()
-        rows = fetch_page_rows(target_url, page, page_size, collapse, sess, headers)
+        rows = fetch_page_rows(
+            target_url, page, page_size, collapse, sess, headers, stop=stop
+        )
         return page, _rows_to_keys(rows, key_opts)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers))
+    try:
         futures = {ex.submit(_work, p): p for p in pages}
-        for fut in concurrent.futures.as_completed(futures):
-            yield fut.result()
+        pending = set(futures)
+        while pending:
+            # A timed wait, so Ctrl+C is noticed on Windows (see
+            # FETCH_POLL_INTERVAL).
+            done, pending = concurrent.futures.wait(
+                pending,
+                timeout=FETCH_POLL_INTERVAL,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            error: BaseException | None = None
+            for fut in sorted(done, key=lambda f: futures[f]):
+                exc = fut.exception()
+                if exc is None:
+                    yield fut.result()
+                elif error is None:
+                    error = exc
+            if error is not None:
+                raise error
+    except BaseException:
+        # Includes GeneratorExit (close() or the consumer leaving its loop)
+        # and KeyboardInterrupt. Cancel first, so that a worker woken by
+        # `stop` does not pick up another queued page.
+        ex.shutdown(wait=False, cancel_futures=True)
+        stop.set()
+        raise
+    ex.shutdown()
 
 
 def _store_resumekey_rows(
@@ -1439,6 +1515,15 @@ examples:
     except CacheError as e:
         logger.error(f"{e}")
         return 1
+    except KeyboardInterrupt:
+        if temp_db is not None:
+            logger.error(
+                "Interrupted. Re-run the same command to start from the beginning. "
+                "Omit --no-cache on future runs to retain progress."
+            )
+        else:
+            logger.error("Interrupted. Re-run the same command to resume.")
+        return 130
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         return 1
