@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1107,13 +1108,24 @@ class TestResumeKeyCache(unittest.TestCase):
     @patch("waygap.time.sleep")
     @patch("requests.Session")
     def test_resume_hint_logged_after_rows_are_saved(self, mock_session_cls, _sleep):
+        input_file = Path(self.enterContext(tempfile.TemporaryDirectory())) / "urls.txt"
+        input_file.touch()
         mock_session_cls.return_value.get.side_effect = self._route_fail_after_one_row
 
         with (
             self.assertLogs("waygap", level="INFO") as logs,
             patch(
                 "sys.argv",
-                ["waygap.py", TARGET, "--cache", self.cache, "--workers", "1"],
+                [
+                    "waygap.py",
+                    TARGET,
+                    "--input",
+                    str(input_file),
+                    "--cache",
+                    self.cache,
+                    "--workers",
+                    "1",
+                ],
             ),
         ):
             self.assertEqual(main(), 1)
@@ -1129,6 +1141,8 @@ class TestResumeKeyCache(unittest.TestCase):
     def test_no_resume_hint_when_saving_rows_fails(
         self, mock_session_cls, _sleep, _insert
     ):
+        input_file = Path(self.enterContext(tempfile.TemporaryDirectory())) / "urls.txt"
+        input_file.touch()
         # The rows before KEY1 are not stored, so resuming from KEY1 would
         # leave them missing from a cache that is later marked complete.
         mock_session_cls.return_value.get.side_effect = self._route_fail_after_one_row
@@ -1137,7 +1151,16 @@ class TestResumeKeyCache(unittest.TestCase):
             self.assertLogs("waygap", level="INFO") as logs,
             patch(
                 "sys.argv",
-                ["waygap.py", TARGET, "--cache", self.cache, "--workers", "1"],
+                [
+                    "waygap.py",
+                    TARGET,
+                    "--input",
+                    str(input_file),
+                    "--cache",
+                    self.cache,
+                    "--workers",
+                    "1",
+                ],
             ),
         ):
             self.assertEqual(main(), 1)
@@ -1403,6 +1426,59 @@ class TestResumeKeyCache(unittest.TestCase):
         self.assertEqual(meta.get("resumekey_v"), RESUMEKEY_FETCH_VERSION)
 
 
+class TestMainInputValidation(unittest.TestCase):
+    """Invalid input must fail before any CDX fetch or temporary cache setup."""
+
+    def test_missing_input_is_rejected_before_fetch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = os.path.join(directory, "missing.txt")
+            for options in ([], ["--no-cache"]):
+                with (
+                    self.subTest(options=options),
+                    patch(
+                        "sys.argv", ["waygap.py", TARGET, "--input", missing, *options]
+                    ),
+                    patch(
+                        "waygap.ensure_archived_db", side_effect=CacheError("stop")
+                    ) as mock_ensure,
+                    patch("waygap.tempfile.mkstemp") as mock_mkstemp,
+                    self.assertLogs("waygap", level="ERROR") as logs,
+                ):
+                    self.assertEqual(main(), 1)
+                mock_ensure.assert_not_called()
+                mock_mkstemp.assert_not_called()
+                self.assertIn(
+                    f"Input file not found: {missing}", "\n".join(logs.output)
+                )
+
+    def test_input_directory_is_rejected_before_fetch(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("sys.argv", ["waygap.py", TARGET, "--input", directory]),
+            patch(
+                "waygap.ensure_archived_db", side_effect=CacheError("stop")
+            ) as mock_ensure,
+            self.assertLogs("waygap", level="ERROR") as logs,
+        ):
+            self.assertEqual(main(), 1)
+        mock_ensure.assert_not_called()
+        self.assertIn(f"Cannot read input file: {directory}", "\n".join(logs.output))
+
+    def test_unreadable_input_is_rejected_before_fetch(self):
+        with (
+            patch("sys.argv", ["waygap.py", TARGET, "--input", "private.txt"]),
+            patch("builtins.open", side_effect=PermissionError("Permission denied")),
+            patch(
+                "waygap.ensure_archived_db", side_effect=CacheError("stop")
+            ) as mock_ensure,
+            self.assertLogs("waygap", level="ERROR") as logs,
+        ):
+            self.assertEqual(main(), 1)
+        mock_ensure.assert_not_called()
+        self.assertIn("Cannot read input file: private.txt", "\n".join(logs.output))
+        self.assertIn("Permission denied", "\n".join(logs.output))
+
+
 class TestMainResumeKeyOptions(unittest.TestCase):
     """Tests for CLI option combinations with --resume-key."""
 
@@ -1421,6 +1497,9 @@ class TestMainResumeKeyOptions(unittest.TestCase):
     def test_failed_fetch_hint_matches_retained_progress(self, mock_ensure):
         from waygap import ResumeKeyRequestError
 
+        input_file = Path(self.enterContext(tempfile.TemporaryDirectory())) / "urls.txt"
+        input_file.touch()
+
         cases = [
             (None, [], False),
             ("KEY1", [], True),
@@ -1432,7 +1511,10 @@ class TestMainResumeKeyOptions(unittest.TestCase):
             with self.subTest(key=key, args=args):
                 mock_ensure.side_effect = ResumeKeyRequestError("request failed", key)
                 with (
-                    patch("sys.argv", ["waygap.py", TARGET, *args]),
+                    patch(
+                        "sys.argv",
+                        ["waygap.py", TARGET, "--input", str(input_file), *args],
+                    ),
                     self.assertLogs("waygap", level="INFO") as logs,
                 ):
                     self.assertEqual(main(), 1)
@@ -1457,8 +1539,10 @@ class TestMainWorkersDefault(unittest.TestCase):
     """Tests for the default --workers value passed to ensure_archived_db."""
 
     def test_default_workers_is_two(self):
+        input_file = Path(self.enterContext(tempfile.TemporaryDirectory())) / "urls.txt"
+        input_file.touch()
         with (
-            patch("sys.argv", ["waygap.py", TARGET]),
+            patch("sys.argv", ["waygap.py", TARGET, "--input", str(input_file)]),
             patch(
                 "waygap.ensure_archived_db", side_effect=CacheError("stop")
             ) as mock_ensure,

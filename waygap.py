@@ -1378,6 +1378,16 @@ examples:
 
     temp_db: str | None = None
     try:
+        try:
+            with open(args.input_file, "rb") as input_file:
+                input_file.read(1)
+        except FileNotFoundError as e:
+            raise InputFileError(f"Input file not found: {args.input_file}") from e
+        except OSError as e:
+            raise InputFileError(
+                f"Cannot read input file: {args.input_file}: {e}"
+            ) from e
+
         cache_file = args.cache_file
         if args.no_cache:
             fd, temp_db = tempfile.mkstemp(prefix="waygap_", suffix=".db")
