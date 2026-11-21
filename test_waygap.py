@@ -1555,6 +1555,15 @@ class TestMainInterrupt(unittest.TestCase):
                 "Interrupted. Re-run the same command to start from the beginning. "
                 "Omit --no-cache on future runs to retain progress.",
             ),
+            (
+                ["--refresh"],
+                "Interrupted. Remove --refresh and re-run the command to resume.",
+            ),
+            (
+                ["--refresh", "--no-cache"],
+                "Interrupted. Re-run the same command to start from the beginning. "
+                "Omit --no-cache on future runs to retain progress.",
+            ),
         ]
         for args, message in cases:
             with self.subTest(args=args):
@@ -2115,6 +2124,57 @@ class TestParallelFetchStops(unittest.TestCase):
     def test_close_sets_stop(self):
         _, stops_set = self._close_after_first_page()
 
+        self.assertTrue(stops_set)
+        self.assertTrue(all(stops_set), stops_set)
+
+    def test_failed_page_stops_workers_before_yielding_its_batch(self):
+        """A failed page and a successful page that complete in the same
+        wait: workers are stopped before the successful page is yielded."""
+        go = threading.Event()
+        changed = threading.Condition()
+
+        def fake(target_url, page, *args, **kwargs):
+            with changed:
+                self.started.append(page)
+                self.stops.append(kwargs.get("stop"))
+                changed.notify_all()
+            if page == 0:
+                return [["http://a.example/"]]
+            if page in (1, 2):
+                go.wait(3)
+                if page == 1:
+                    raise CDXAPIError("page 1 failed")
+                return [["http://c.example/"]]
+            self.release.wait(3)
+            return []
+
+        with patch("waygap.fetch_page_rows", fake), _join_new_threads():
+            try:
+                gen = self._pages(10, 3)
+                self.assertEqual(next(gen)[0], 0)
+                # While the generator is suspended, let pages 1 and 2 finish.
+                # A worker starts its next page (4 or 5) only after storing
+                # the result of the previous one, so once both have started,
+                # pages 1 and 2 are complete and land in the same wait.
+                go.set()
+                with changed:
+                    both_done = changed.wait_for(
+                        lambda: {4, 5} <= set(self.started), timeout=3
+                    )
+                self.assertTrue(both_done, self.started)
+
+                page, _ = next(gen)
+                with changed:
+                    stops_set = [
+                        isinstance(s, threading.Event) and s.is_set()
+                        for s in self.stops
+                    ]
+                with self.assertRaises(CDXAPIError):
+                    next(gen)
+            finally:
+                self.release.set()
+
+        self.assertEqual(page, 2)
         self.assertTrue(stops_set)
         self.assertTrue(all(stops_set), stops_set)
 

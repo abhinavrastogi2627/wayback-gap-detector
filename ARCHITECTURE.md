@@ -103,7 +103,7 @@ flowchart TD
 | `fetch_page_rows(target_url, page, page_size, collapse, session, headers, stop=None) -> list[list]` | Fetches one page (follows in-page resumeKey chaining when the server returns one; `limit` is not sent). Passes `stop` to `_get_with_retries` |
 | `fetch_resumekey_rows(target_url, initial_resume_key, limit, collapse, session, headers) -> Generator` | Generator for sequential resumeKey fetching (`limit` is the chunk size). Ends normally only when a response carries no resumeKey; a chunk with a resumeKey but no data rows is followed, and a repeated resumeKey raises `CDXAPIError`. A failed request raises `ResumeKeyRequestError` (a `CDXAPIError` subclass carrying the key of the failed request); it does not log the key itself |
 | `_rows_to_keys(rows, key_opts) -> list[str]` | Converts CDX rows (`fl=original`) into a list of surt keys (`original` spellings are not stored) |
-| `_fetch_pages_parallel(target_url, pages, page_size, key_opts, workers, headers, collapse) -> Generator[tuple[int, list[str]]]` | Fetches the given pages in a thread pool and yields `(page, keys)` as they complete. Waits with `concurrent.futures.wait(FIRST_COMPLETED)` in polls of `FETCH_POLL_INTERVAL` (0.5 s) so Ctrl+C is noticed on Windows. Pages completed in the same poll are yielded in page order, and a failed page among them is raised after the successful ones. Workers share one stop event, passed to `fetch_page_rows(..., stop=)`. On any exit other than normal completion (failed page, `close()`, Ctrl+C), cancels the queued pages, then sets the stop event (see [Stopping a pagination fetch](#stopping-a-pagination-fetch)) |
+| `_fetch_pages_parallel(target_url, pages, page_size, key_opts, workers, headers, collapse) -> Generator[tuple[int, list[str]]]` | Fetches the given pages in a thread pool and yields `(page, keys)` as they complete. Waits with `concurrent.futures.wait(FIRST_COMPLETED)` in polls of `FETCH_POLL_INTERVAL` (0.5 s) so Ctrl+C is noticed on Windows. Pages completed in the same poll are yielded in page order; if one of them failed, the workers are stopped before the successful ones are yielded, and the failure is raised after them. Workers share one stop event, passed to `fetch_page_rows(..., stop=)`. On any exit other than normal completion (failed page, `close()`, Ctrl+C), cancels the queued pages, then sets the stop event (see [Stopping a pagination fetch](#stopping-a-pagination-fetch)) |
 
 ### Orchestration and matching
 
@@ -113,7 +113,7 @@ flowchart TD
 | `_store_resumekey_rows(conn, rows, key_opts) -> int` | Inserts the keys of `fetch_resumekey_rows` rows in batches and returns the count. Pending keys are flushed on every exit (including errors and Ctrl+C). After a failed request (`ResumeKeyRequestError`), the error propagates only after the flush succeeds. The CLI decides whether the stored progress can be resumed. If the flush fails, the `sqlite3` error propagates and no resumeKey is logged |
 | `count_input_lines(input_file: str) -> int \| None` | Counts total lines quickly for the `scan_input_against_db` progress bar (returns `None` on failure) |
 | `scan_input_against_db(input_file, db_path, key_opts=None, output_file=None, output_archived=None, batch_size=LOOKUP_BATCH_SIZE) -> tuple[int, int, int]` | Streams, keys, batch-queries, and incrementally writes the input, returning `(total, not archived, archived)` (production path) |
-| `main() -> int` | CLI entry point (argument parsing, `build_key_opts`, DB setup, matching, exit code). Validates that the input file exists and can be read before cache setup or CDX requests. Rejects `--resume-key` combined with `--no-cache` or `--refresh`. On a failed resumeKey request, suggests a key only with persistent progress and a nonempty key; otherwise suggests re-running from the beginning. On Ctrl+C, logs `Interrupted. Re-run the same command to resume.` (with `--no-cache`, a hint to start from the beginning and omit `--no-cache` on future runs) and returns 130 |
+| `main() -> int` | CLI entry point (argument parsing, `build_key_opts`, DB setup, matching, exit code). Validates that the input file exists and can be read before cache setup or CDX requests. Rejects `--resume-key` combined with `--no-cache` or `--refresh`. On a failed resumeKey request, suggests a key only with persistent progress and a nonempty key; otherwise suggests re-running from the beginning. On Ctrl+C, logs `Interrupted. Re-run the same command to resume.` and returns 130. With `--refresh`, it asks to remove `--refresh` before re-running instead (re-running with it would delete the retained cache); with `--no-cache`, it suggests starting from the beginning and omitting `--no-cache` on future runs |
 
 Pagination progress reads the existing archived count once before fetching, then
 adds the `conn.total_changes` delta around each `insert_urls()` call. This counts
@@ -127,7 +127,9 @@ When a page fails, the consumer closes the generator, or Ctrl+C arrives,
 queued page:
 
 1. `ex.shutdown(wait=False, cancel_futures=True)` cancels the queued pages,
-   so no worker picks up another one.
+   so no worker picks up another one. When a failed page completes in the
+   same poll as successful ones, steps 1 and 2 run before those pages are
+   yielded; they run only once.
 2. The shared stop event is set. Workers waiting on the rate limiter or
    between retries wake at once and end with `_FetchCancelled`; a request
    already in progress finishes first (up to about 4 minutes with urllib3

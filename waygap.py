@@ -814,8 +814,9 @@ def _fetch_pages_parallel(
 ) -> Generator[tuple[int, list[str]], None, None]:
     """Fetch pages concurrently; yields (page, surt_keys) as they complete.
 
-    Pages completed in the same wait are yielded in page order, and a
-    failed page among them is raised after the successful ones. When the
+    Pages completed in the same wait are yielded in page order. If one of
+    them failed, the workers are stopped before the successful ones are
+    yielded, and the failure is raised after them. When the
     generator exits early (failed page, close(), Ctrl+C), queued pages are
     cancelled and the workers are told to stop; requests already in
     progress are not interrupted.
@@ -849,21 +850,27 @@ def _fetch_pages_parallel(
                 timeout=FETCH_POLL_INTERVAL,
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
-            error: BaseException | None = None
-            for fut in sorted(done, key=lambda f: futures[f]):
-                exc = fut.exception()
-                if exc is None:
+            ordered = sorted(done, key=lambda f: futures[f])
+            errors = [exc for f in ordered if (exc := f.exception()) is not None]
+            if errors:
+                # Stop before yielding the successful pages of this wait, so
+                # workers do not fetch more pages while the consumer stores
+                # them. Cancel first, as below.
+                ex.shutdown(wait=False, cancel_futures=True)
+                stop.set()
+            for fut in ordered:
+                if fut.exception() is None:
                     yield fut.result()
-                elif error is None:
-                    error = exc
-            if error is not None:
-                raise error
+            if errors:
+                raise errors[0]
     except BaseException:
         # Includes GeneratorExit (close() or the consumer leaving its loop)
         # and KeyboardInterrupt. Cancel first, so that a worker woken by
-        # `stop` does not pick up another queued page.
-        ex.shutdown(wait=False, cancel_futures=True)
-        stop.set()
+        # `stop` does not pick up another queued page. `stop` is set only
+        # after the cancel, so a set `stop` means both are already done.
+        if not stop.is_set():
+            ex.shutdown(wait=False, cancel_futures=True)
+            stop.set()
         raise
     ex.shutdown()
 
@@ -1520,6 +1527,11 @@ examples:
             logger.error(
                 "Interrupted. Re-run the same command to start from the beginning. "
                 "Omit --no-cache on future runs to retain progress."
+            )
+        elif args.refresh:
+            # Re-running with --refresh would delete the retained cache.
+            logger.error(
+                "Interrupted. Remove --refresh and re-run the command to resume."
             )
         else:
             logger.error("Interrupted. Re-run the same command to resume.")
