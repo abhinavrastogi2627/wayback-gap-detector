@@ -1183,6 +1183,8 @@ class TestResumeKeyCache(unittest.TestCase):
     def test_no_resume_hint_when_checkpoint_cannot_be_saved(
         self, mock_session_cls, _sleep
     ):
+        input_file = Path(self.enterContext(tempfile.TemporaryDirectory())) / "urls.txt"
+        input_file.touch()
         mock_session_cls.return_value.get.side_effect = self._route_fail_after_one_row
         original_write = write_meta
 
@@ -1194,7 +1196,17 @@ class TestResumeKeyCache(unittest.TestCase):
         with (
             patch("waygap.write_meta", side_effect=write),
             self.assertLogs("waygap", level="INFO") as logs,
-            patch("sys.argv", ["waygap.py", TARGET, "--cache", self.cache]),
+            patch(
+                "sys.argv",
+                [
+                    "waygap.py",
+                    TARGET,
+                    "--input",
+                    str(input_file),
+                    "--cache",
+                    self.cache,
+                ],
+            ),
         ):
             self.assertEqual(main(), 1)
         keys, meta = self._state()
