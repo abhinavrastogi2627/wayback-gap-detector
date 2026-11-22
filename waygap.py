@@ -85,9 +85,9 @@ CDX_COLLAPSE_STRICT = "original"
 # if time-based features are ever needed.
 CDX_FL = "original"
 # Minimum seconds between the starts of two CDX requests, shared by all
-# threads. The CDX search API is limited to about 24 requests per minute
-# (per the `wayback` library v0.5.1, 2026-06); 3 s (20 per minute, ~83%
-# of the limit) leaves headroom for retries.
+# threads. The CDX search API has a hard limit of 30 requests per minute;
+# the `wayback` library (v0.5.1, 2026-06) defaults to 80% of it, 24 per
+# minute. 3 s (20 per minute, ~67% of the limit) leaves headroom for retries.
 CDX_REQUEST_INTERVAL = 3.0
 # Page fetch workers. The request rate is set by CDX_REQUEST_INTERVAL, so
 # workers only hide response latency; 2 keep the interval filled.
