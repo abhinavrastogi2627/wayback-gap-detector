@@ -1199,7 +1199,7 @@ def detect_not_archived(
     archived = [] if collect_archived else None
     total_count = 0
 
-    with open(input_file, encoding="utf-8") as f:
+    with open(input_file, encoding="utf-8-sig") as f:
         for line in f:
             original_url = line.strip()
 
@@ -1290,7 +1290,7 @@ def scan_input_against_db(
                             out_f.write(original + "\n")
                 batch.clear()
 
-            with open(input_file, encoding="utf-8") as f:
+            with open(input_file, encoding="utf-8-sig") as f:
                 with tqdm(total=total_lines, desc="Checking URLs", unit="url") as bar:
                     for line in f:
                         original_url = line.strip()
@@ -1464,7 +1464,7 @@ examples:
     temp_db: str | None = None
     try:
         try:
-            with open(args.input_file, encoding="utf-8") as input_file:
+            with open(args.input_file, encoding="utf-8-sig") as input_file:
                 while input_file.read(1024 * 1024):
                     pass
         except FileNotFoundError as e:
