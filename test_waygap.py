@@ -1534,6 +1534,25 @@ class TestMainInputValidation(unittest.TestCase):
                         "\n".join(logs.output),
                     )
 
+    def test_valid_utf8_split_across_chunks_reaches_fetch(self):
+        # "あ" starts 1 byte before 1 MiB, so every chunk size up to 1 MiB splits it.
+        head = b"https://example.com/"
+        boundary = 1024 * 1024
+        data = head + b"a" * (boundary - 1 - len(head)) + "あ\n".encode()
+        with tempfile.TemporaryDirectory() as directory:
+            input_file = Path(directory) / "urls.txt"
+            input_file.write_bytes(data)
+            with (
+                patch("sys.argv", ["waygap.py", TARGET, "--input", str(input_file)]),
+                patch(
+                    "waygap.ensure_archived_db", side_effect=CacheError("stop")
+                ) as mock_ensure,
+                self.assertLogs("waygap", level="ERROR") as logs,
+            ):
+                self.assertEqual(main(), 1)
+            mock_ensure.assert_called_once()
+            self.assertNotIn("not valid UTF-8", "\n".join(logs.output))
+
     def test_input_directory_is_rejected_before_fetch(self):
         with (
             tempfile.TemporaryDirectory() as directory,
