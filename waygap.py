@@ -67,9 +67,10 @@ USER_AGENT = f"Wayback-Gap-Detector/{__version__} (https://github.com/nabikita39
 DB_SCHEMA_VERSION = "1"
 # Written to meta["resumekey_v"] when a resumeKey fallback fetch starts from
 # the beginning. Earlier versions could mark an incomplete resumeKey cache
-# as completed, so a completed resumeKey cache without it is fetched again.
+# as completed (including after an unchecked manual resume), so older
+# completed resumeKey caches are fetched again.
 # Not part of expected_meta(): pagination caches are not affected.
-RESUMEKEY_FETCH_VERSION = "2"
+RESUMEKEY_FETCH_VERSION = "3"
 LOOKUP_BATCH_SIZE = 500
 INSERT_CHUNK_SIZE = 10000
 
@@ -908,7 +909,11 @@ def _store_resumekey_rows(
                     insert_urls(conn, batch)
                     inserted += len(batch)
                     bar.update(len(batch))
-        except CDXAPIError:
+        except CDXAPIError as error:
+            if isinstance(error, ResumeKeyRequestError) and error.resume_key:
+                # The finally block above has saved all rows before this request.
+                # If either the flush or this write fails, no resume hint escapes.
+                write_meta(conn, {"resume_key": error.resume_key})
             logger.error(f"Fetched rows stored ({inserted} records).")
             raise
     return inserted
@@ -972,6 +977,20 @@ def ensure_archived_db(
                     "automatically; run without --resume-key"
                 )
 
+            if meta.get("resumekey_v") != RESUMEKEY_FETCH_VERSION or not meta.get(
+                "resume_key"
+            ):
+                raise CacheError(
+                    f"{cache_file} has no verified saved resume key; "
+                    "run without --resume-key to fetch from the beginning"
+                )
+            if initial_resume_key != meta["resume_key"]:
+                raise CacheError(
+                    f"--resume-key does not match the saved resume key in {cache_file}; "
+                    "use the key logged for this cache or run without --resume-key "
+                    "to fetch from the beginning"
+                )
+
         if initial_resume_key is None and params_match and is_completed(conn):
             if (
                 meta.get("mode") == "resumekey"
@@ -1028,6 +1047,8 @@ def ensure_archived_db(
             # told apart from a pagination cache when --resume-key is used.
             # resumekey_v marks a fetch that started from the beginning with
             # this version; a --resume-key run keeps the cache's marker as is.
+            # A previous checkpoint cannot verify progress in this new fetch.
+            conn.execute("DELETE FROM meta WHERE k='resume_key';")
             write_meta(
                 conn,
                 {
@@ -1443,10 +1464,15 @@ examples:
     temp_db: str | None = None
     try:
         try:
-            with open(args.input_file, "rb") as input_file:
-                input_file.read(1)
+            with open(args.input_file, encoding="utf-8") as input_file:
+                while input_file.read(1024 * 1024):
+                    pass
         except FileNotFoundError as e:
             raise InputFileError(f"Input file not found: {args.input_file}") from e
+        except UnicodeDecodeError as e:
+            raise InputFileError(
+                f"Input file is not valid UTF-8: {args.input_file}. Save it as UTF-8 and try again."
+            ) from e
         except OSError as e:
             raise InputFileError(
                 f"Cannot read input file: {args.input_file}: {e}"

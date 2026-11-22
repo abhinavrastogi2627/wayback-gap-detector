@@ -112,7 +112,7 @@ python waygap.py "https://example.com/blog/*" \
   --resume-key "<RESUME_KEY>"
 ```
 
-`--resume-key` は、同じキャッシュで中断したフォールバック取得を続けるためだけのオプションです。キャッシュファイルが存在し、未完了で、同じ対象URL・オプションで作られている必要があります。条件を満たさない場合は、キャッシュを削除・上書きせずにエラーで停止します。`--no-cache` や `--refresh` とは併用できません。
+`--resume-key` は、同じキャッシュで中断したフォールバック取得を続けるためだけのオプションです。キャッシュファイルが存在し、未完了で、同じ対象URL・オプションで作られている必要があります。キーは、リクエスト失敗時にそれ以前の行を保存してから同じキャッシュに記録したチェックポイントと一致する必要があります。別の実行のキーや、検証済みチェックポイントのない古いキャッシュは拒否されます。その場合は `--resume-key` を外すと、保存済みURLを残したまま最初から再取得できます。条件を満たさない場合は、キャッシュを削除・上書きせずにエラーで停止します。`--no-cache` や `--refresh` とは併用できません。
 
 最初のフォールバックリクエストが失敗し、まだ再開キーを受け取っていない場合は、同じコマンドを再実行して最初から取得してください。`--no-cache` の場合も、終了時に一時DBが削除されるため、再実行は最初からになります。進捗を残したい場合は、次回の実行から `--no-cache` を外してください。
 
@@ -120,7 +120,7 @@ python waygap.py "https://example.com/blog/*" \
 
 ## 入力ファイル形式
 
-`urls.txt`（または `--input` で指定したファイル）は1行に1URLで記述します:
+`urls.txt`（または `--input` で指定したファイル）はUTF-8で保存し、1行に1URLを記述します:
 
 ```
 https://example.com/blog/post-1
@@ -170,6 +170,22 @@ CIでも同じチェックを実行します。`uv add` で依存関係を変更
 `git config blame.ignoreRevsFile .git-blame-ignore-revs` を実行します。
 
 Issueやプルリクエストは歓迎します。プルリクエストは1つの論理的変更に絞ってください。
+
+---
+
+## 貢献者
+
+- [nabikita3974](https://github.com/nabikita3974)
+- [abhinavrastogi2627](https://github.com/abhinavrastogi2627)
+- [imshah-id](https://github.com/imshah-id)
+
+---
+
+## 謝辞
+
+- Wayback Machine と CDX API を提供する [Internet Archive](https://archive.org/)
+- URL正規化に使用している [surt](https://github.com/internetarchive/surt)
+- CDX API のリクエスト上限の参考にした、EDGI の [wayback](https://github.com/edgi-govdata-archiving/wayback)
 
 ---
 
