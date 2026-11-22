@@ -1464,7 +1464,7 @@ examples:
     temp_db: str | None = None
     try:
         try:
-            with open(args.input_file, encoding="utf-8-sig") as input_file:
+            with open(args.input_file, encoding="utf-8") as input_file:
                 while input_file.read(1024 * 1024):
                     pass
         except FileNotFoundError as e:

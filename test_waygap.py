@@ -1665,6 +1665,8 @@ class TestMainInputValidation(unittest.TestCase):
             input_file = Path(directory) / "urls.txt"
             cases = {
                 "utf16": "https://example.com/\n".encode("utf-16"),
+                "bom_first_byte_only": b"\xef",
+                "bom_first_two_bytes_only": b"\xef\xbb",
                 "invalid_after_first_chunk": (
                     b"https://example.com/\n" * 100_000 + b"https://example.com/\x82\n"
                 ),
