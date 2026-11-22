@@ -118,7 +118,11 @@ python waygap.py "https://example.com/blog/*" \
 
 `--resume-key` only continues an interrupted fallback fetch in the same cache:
 the cache file must exist, be incomplete, and have been built with the same
-target URL and options. Otherwise the tool stops with an error without
+target URL and options. The key must match the checkpoint saved in that cache
+when a request failed, after its preceding rows were stored. Keys from another
+run and older caches without a verified checkpoint are rejected; omit
+`--resume-key` to fetch again from the beginning while keeping stored URLs.
+Otherwise the tool stops with an error without
 deleting or overwriting the cache. It cannot be combined with `--no-cache` or
 `--refresh`.
 
@@ -198,6 +202,21 @@ formatting commits in `git blame`, run
 `git config blame.ignoreRevsFile .git-blame-ignore-revs`.
 
 Issues and pull requests are welcome; please keep each PR to one logical change.
+
+---
+
+## Contributors
+
+- [nabikita3974](https://github.com/nabikita3974)
+- [abhinavrastogi2627](https://github.com/abhinavrastogi2627)
+
+---
+
+## Acknowledgements
+
+- [Internet Archive](https://archive.org/) for the Wayback Machine and its CDX API
+- [surt](https://github.com/internetarchive/surt) for URL canonicalization
+- [wayback](https://github.com/edgi-govdata-archiving/wayback) by EDGI, whose release notes documented the CDX API rate limit
 
 ---
 
