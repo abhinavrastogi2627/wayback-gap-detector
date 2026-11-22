@@ -177,6 +177,7 @@ Issueやプルリクエストは歓迎します。プルリクエストは1つ�
 
 - [nabikita3974](https://github.com/nabikita3974)
 - [abhinavrastogi2627](https://github.com/abhinavrastogi2627)
+- [imshah-id](https://github.com/imshah-id)
 
 ---
 
