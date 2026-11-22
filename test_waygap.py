@@ -9,6 +9,7 @@ Numeric-shaped hosts are covered explicitly (they are the only place
 where our keys intentionally diverge from surt's gethostbyname_ex path).
 """
 
+import _thread
 import contextlib
 import io
 import json
@@ -16,6 +17,8 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -80,6 +83,26 @@ def _json_response(payload):
 def _no_cdx_throttle(monkeypatch):
     """Disable the CDX request interval so tests do not sleep."""
     monkeypatch.setattr(waygap, "_CDX_LIMITER", _RateLimiter(0))
+
+
+@contextlib.contextmanager
+def _join_new_threads(timeout: float = 10.0):
+    """Wait for the non-daemon threads started inside the block to finish.
+
+    Page fetch workers may outlive the call that started them, so a test
+    must wait for them before leaving its mock patches (a late worker would
+    run the real fetch) or starting the next run.
+    """
+    before = set(threading.enumerate())
+    try:
+        yield
+    finally:
+        new = [t for t in threading.enumerate() if t not in before and not t.daemon]
+        for t in new:
+            t.join(timeout)
+        alive = [t.name for t in new if t.is_alive()]
+        if alive:
+            raise AssertionError(f"threads still running: {alive}")
 
 
 class TestBuildKeyOpts(unittest.TestCase):
@@ -760,6 +783,89 @@ class TestCdxRateLimiter(unittest.TestCase):
             get_num_pages("http://example.com/*", None, CDX_COLLAPSE, mock_session, {})
 
         mock_limiter.wait.assert_called_once_with()
+
+
+class TestFetchCancellation(unittest.TestCase):
+    """Tests for the stop event that cancels page fetch workers."""
+
+    @staticmethod
+    def _set_stop() -> threading.Event:
+        stop = threading.Event()
+        stop.set()
+        return stop
+
+    @patch("waygap.time.sleep")
+    def test_pause_without_stop_sleeps(self, mock_sleep):
+        waygap._pause(2.0, None)
+
+        mock_sleep.assert_called_once_with(2.0)
+
+    @patch("waygap.time.sleep")
+    def test_pause_raises_at_once_when_stop_is_set(self, mock_sleep):
+        start = time.monotonic()
+        with self.assertRaises(waygap._FetchCancelled):
+            waygap._pause(5.0, self._set_stop())
+
+        self.assertLess(time.monotonic() - start, 1.0)
+        mock_sleep.assert_not_called()
+
+    @patch("waygap.time.sleep")
+    @patch("waygap.time.monotonic", return_value=100.0)
+    def test_rate_limiter_raises_without_sleeping_when_stop_is_set(
+        self, _monotonic, mock_sleep
+    ):
+        limiter = _RateLimiter(3.0)
+        limiter.wait()  # the next call has a reserved 3 s wait
+
+        with self.assertRaises(waygap._FetchCancelled):
+            limiter.wait(self._set_stop())
+
+        mock_sleep.assert_not_called()
+
+    @patch("requests.Session")
+    def test_get_with_retries_skips_request_when_stopped(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+
+        with self.assertRaises(waygap._FetchCancelled):
+            _get_with_retries(
+                mock_session, "https://example.invalid/", {}, {}, stop=self._set_stop()
+            )
+
+        mock_session.get.assert_not_called()
+
+    @patch("requests.Session")
+    def test_get_with_retries_error_after_stop_cancels_without_warning(
+        self, mock_session_cls
+    ):
+        stop = threading.Event()
+
+        def _get(*args, **kwargs):
+            stop.set()
+            raise requests.exceptions.ConnectionError("reset")
+
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = _get
+
+        with (
+            self.assertNoLogs("waygap", level="WARNING"),
+            self.assertRaises(waygap._FetchCancelled),
+        ):
+            _get_with_retries(
+                mock_session, "https://example.invalid/", {}, {}, stop=stop
+            )
+
+        self.assertEqual(mock_session.get.call_count, 1)
+
+    @patch("requests.Session")
+    def test_fetch_page_rows_skips_request_when_stopped(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+
+        with self.assertRaises(waygap._FetchCancelled):
+            fetch_page_rows(
+                TARGET, 0, None, None, mock_session, {}, stop=self._set_stop()
+            )
+
+        mock_session.get.assert_not_called()
 
 
 class TestFetchPageRowsChaining(unittest.TestCase):
@@ -1656,6 +1762,47 @@ class TestMainWorkersDefault(unittest.TestCase):
         self.assertEqual(mock_ensure.call_args.kwargs["workers"], 2)
 
 
+class TestMainInterrupt(unittest.TestCase):
+    """Tests for Ctrl+C handling in main()."""
+
+    @patch("waygap.ensure_archived_db", side_effect=KeyboardInterrupt)
+    def test_ctrl_c_exits_with_130_and_rerun_hint(self, _ensure):
+        input_file = Path(self.enterContext(tempfile.TemporaryDirectory())) / "urls.txt"
+        input_file.touch()
+        cases = [
+            ([], "Interrupted. Re-run the same command to resume."),
+            (
+                ["--no-cache"],
+                "Interrupted. Re-run the same command to start from the beginning. "
+                "Omit --no-cache on future runs to retain progress.",
+            ),
+            (
+                ["--refresh"],
+                "Interrupted. Remove --refresh and re-run the command to resume.",
+            ),
+            (
+                ["--refresh", "--no-cache"],
+                "Interrupted. Re-run the same command to start from the beginning. "
+                "Omit --no-cache on future runs to retain progress.",
+            ),
+        ]
+        for args, message in cases:
+            with self.subTest(args=args):
+                with (
+                    patch(
+                        "sys.argv",
+                        ["waygap.py", TARGET, "--input", str(input_file), *args],
+                    ),
+                    self.assertLogs("waygap", level="ERROR") as logs,
+                ):
+                    try:
+                        code = main()
+                    except KeyboardInterrupt:
+                        self.fail("KeyboardInterrupt escaped main()")
+                self.assertEqual(code, 130)
+                self.assertEqual([r.getMessage() for r in logs.records], [message])
+
+
 class TestCDXPaginationDB(unittest.TestCase):
     """Tests for pagination fetch into SQLite (mocked API)."""
 
@@ -1705,13 +1852,9 @@ class TestCDXPaginationDB(unittest.TestCase):
             if os.path.exists(cache_path):
                 os.unlink(cache_path)
 
-    @patch(
-        "waygap.concurrent.futures.as_completed",
-        side_effect=lambda futures: iter(futures),
-    )
     @patch("requests.Session")
     def test_pagination_progress_counts_unique_rows_without_per_page_counts(
-        self, mock_session_cls, _as_completed
+        self, mock_session_cls
     ):
         pages = [
             [["original"], ["http://a.example/"], ["http://a.example/"]],
@@ -1762,16 +1905,14 @@ class TestCDXPaginationDB(unittest.TestCase):
                     [record.getMessage() for record in logs.records],
                 )
 
-    @patch(
-        "waygap.concurrent.futures.as_completed",
-        side_effect=lambda futures: iter(futures),
-    )
-    @patch("waygap.time.sleep")
+    @patch("waygap._pause")
     @patch("requests.Session")
     def test_pagination_progress_resumes_after_failed_page(
-        self, mock_session_cls, _sleep, _as_completed
+        self, mock_session_cls, _pause
     ):
-        # Consume futures in page order so page 0 is persisted before page 1 fails.
+        # With one worker, page 0 completes first, and _fetch_pages_parallel
+        # yields completed pages before raising a failed page, so page 0 is
+        # stored before the failure.
         fail = True
         requested_pages = []
 
@@ -1805,6 +1946,53 @@ class TestCDXPaginationDB(unittest.TestCase):
             bar = progress.return_value.__enter__.return_value
             bar.set_postfix.assert_called_once_with(records=2)
             self.assertEqual(count.call_count, 2)
+
+    @patch("requests.Session")
+    def test_pagination_interrupt_keeps_stored_pages(self, mock_session_cls):
+        requested_pages = []
+
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _json_response(3)
+            page = params["page"]
+            requested_pages.append(page)
+            return _json_response([["original"], [f"http://p{page}.example/"]])
+
+        mock_session_cls.return_value.get.side_effect = _route
+        inserts = 0
+
+        def _insert_then_interrupt(conn, keys):
+            nonlocal inserts
+            inserts += 1
+            if inserts == 2:
+                raise KeyboardInterrupt
+            return insert_urls(conn, keys)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = os.path.join(tmp, "cache.db")
+            with (
+                _join_new_threads(),
+                patch("waygap.insert_urls", side_effect=_insert_then_interrupt),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                ensure_archived_db(TARGET, cache_path, workers=1)
+
+            conn = sqlite3.connect(cache_path)
+            try:
+                done = {r[0] for r in conn.execute("SELECT page FROM pages_done;")}
+                keys = {r[0] for r in conn.execute("SELECT key FROM archived;")}
+                completed = read_meta(conn).get("completed")
+            finally:
+                conn.close()
+            self.assertEqual(done, {0})
+            self.assertEqual(keys, {normalize_key("http://p0.example/")})
+            self.assertEqual(completed, "0")
+
+            requested_pages.clear()
+            with _join_new_threads():
+                ensure_archived_db(TARGET, cache_path, workers=1)
+            self.assertEqual(requested_pages, [1, 2])
 
     @patch("requests.Session")
     def test_pagination_strict_uses_original_collapse(self, mock_session_cls):
@@ -2013,6 +2201,203 @@ class TestCDXPaginationDB(unittest.TestCase):
         finally:
             if os.path.exists(cache_path):
                 os.unlink(cache_path)
+
+
+class TestParallelFetchStops(unittest.TestCase):
+    """A failed page, close() or Ctrl+C stops the remaining page fetches."""
+
+    def setUp(self):
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+        self.started: list[int] = []
+        self.stops: list[object] = []
+
+    def _fake_fetch(self, page0: str):
+        """Stand-in for fetch_page_rows that does not use `stop`.
+
+        Page 0 fails ("fail"), returns one row ("ok") or blocks ("block");
+        the other pages block until self.release is set (at most 3 s).
+        """
+
+        def fake(target_url, page, *args, **kwargs):
+            with self.lock:
+                self.started.append(page)
+                self.stops.append(kwargs.get("stop"))
+            if page == 0 and page0 == "fail":
+                raise CDXAPIError("page 0 failed")
+            if page == 0 and page0 == "ok":
+                return [["http://a.example/"]]
+            self.release.wait(3)
+            return []
+
+        return fake
+
+    @staticmethod
+    def _pages(count: int, workers: int):
+        return waygap._fetch_pages_parallel(
+            TARGET, list(range(count)), None, None, workers, {}, None
+        )
+
+    def _run_in_thread(self, consume):
+        """Run consume() in a thread and wait for it for 1 s.
+
+        Returns the outcome ({"result": ...} or {"error": ...}), or None if
+        it did not finish in time, and whether each stop event seen by the
+        fake fetch was set at that moment.
+        """
+        outcome: dict[str, object] = {}
+
+        def target():
+            try:
+                outcome["result"] = consume()
+            except BaseException as e:
+                outcome["error"] = e
+
+        thread = threading.Thread(target=target)
+        thread.start()
+        thread.join(1)
+        finished = None if thread.is_alive() else dict(outcome)
+        with self.lock:
+            stops_set = [
+                isinstance(s, threading.Event) and s.is_set() for s in self.stops
+            ]
+        return finished, stops_set
+
+    def _fail_page_0(self):
+        with (
+            patch("waygap.fetch_page_rows", self._fake_fetch("fail")),
+            _join_new_threads(),
+        ):
+            try:
+                gen = self._pages(200, 4)
+                return self._run_in_thread(lambda: list(gen))
+            finally:
+                self.release.set()
+
+    def _close_after_first_page(self):
+        with (
+            patch("waygap.fetch_page_rows", self._fake_fetch("ok")),
+            _join_new_threads(),
+        ):
+            try:
+                gen = self._pages(200, 4)
+
+                def consume():
+                    first = next(gen)
+                    gen.close()
+                    return first
+
+                return self._run_in_thread(consume)
+            finally:
+                self.release.set()
+
+    def test_failed_page_stops_remaining_pages(self):
+        finished, _ = self._fail_page_0()
+
+        if finished is None:
+            self.fail(
+                f"error not reported within 1 s; pages started: {len(self.started)}"
+            )
+        self.assertIsInstance(finished.get("error"), CDXAPIError)
+        self.assertLessEqual(len(self.started), 5)
+
+    def test_close_stops_remaining_pages(self):
+        finished, _ = self._close_after_first_page()
+
+        if finished is None:
+            self.fail(
+                f"close() did not return within 1 s; pages started: {len(self.started)}"
+            )
+        self.assertEqual(
+            finished.get("result"), (0, [normalize_key("http://a.example/")])
+        )
+        self.assertLessEqual(len(self.started), 5)
+
+    def test_ctrl_c_stops_waiting_and_remaining_pages(self):
+        with (
+            patch("waygap.fetch_page_rows", self._fake_fetch("block")),
+            _join_new_threads(),
+        ):
+            timer = threading.Timer(0.2, _thread.interrupt_main)
+            try:
+                gen = self._pages(8, 4)
+                start = time.monotonic()
+                with self.assertRaises(KeyboardInterrupt):
+                    timer.start()
+                    for _ in gen:
+                        pass
+                elapsed = time.monotonic() - start
+            finally:
+                timer.cancel()
+                self.release.set()
+
+        self.assertLess(
+            elapsed, 2.0, f"interrupt took {elapsed:.1f} s; started: {self.started}"
+        )
+        self.assertLessEqual(len(self.started), 4)
+
+    def test_failed_page_sets_stop(self):
+        _, stops_set = self._fail_page_0()
+
+        self.assertTrue(stops_set)
+        self.assertTrue(all(stops_set), stops_set)
+
+    def test_close_sets_stop(self):
+        _, stops_set = self._close_after_first_page()
+
+        self.assertTrue(stops_set)
+        self.assertTrue(all(stops_set), stops_set)
+
+    def test_failed_page_stops_workers_before_yielding_its_batch(self):
+        """A failed page and a successful page that complete in the same
+        wait: workers are stopped before the successful page is yielded."""
+        go = threading.Event()
+        changed = threading.Condition()
+
+        def fake(target_url, page, *args, **kwargs):
+            with changed:
+                self.started.append(page)
+                self.stops.append(kwargs.get("stop"))
+                changed.notify_all()
+            if page == 0:
+                return [["http://a.example/"]]
+            if page in (1, 2):
+                go.wait(3)
+                if page == 1:
+                    raise CDXAPIError("page 1 failed")
+                return [["http://c.example/"]]
+            self.release.wait(3)
+            return []
+
+        with patch("waygap.fetch_page_rows", fake), _join_new_threads():
+            try:
+                gen = self._pages(10, 3)
+                self.assertEqual(next(gen)[0], 0)
+                # While the generator is suspended, let pages 1 and 2 finish.
+                # A worker starts its next page (4 or 5) only after storing
+                # the result of the previous one, so once both have started,
+                # pages 1 and 2 are complete and land in the same wait.
+                go.set()
+                with changed:
+                    both_done = changed.wait_for(
+                        lambda: {4, 5} <= set(self.started), timeout=3
+                    )
+                self.assertTrue(both_done, self.started)
+
+                page, _ = next(gen)
+                with changed:
+                    stops_set = [
+                        isinstance(s, threading.Event) and s.is_set()
+                        for s in self.stops
+                    ]
+                with self.assertRaises(CDXAPIError):
+                    next(gen)
+            finally:
+                self.release.set()
+
+        self.assertEqual(page, 2)
+        self.assertTrue(stops_set)
+        self.assertTrue(all(stops_set), stops_set)
 
 
 class TestVersion(unittest.TestCase):

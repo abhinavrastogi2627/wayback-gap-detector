@@ -92,17 +92,18 @@ flowchart TD
 
 | Signature | Description |
 |---|---|
-| `_RateLimiter(interval).wait() -> None` | Spaces calls at least `interval` seconds apart across threads (reserves a slot under a lock, sleeps outside it). The module-level `_CDX_LIMITER` uses `CDX_REQUEST_INTERVAL` (3.0 s) and is shared by every CDX request |
+| `_pause(seconds, stop) -> None` | Waits for `seconds`: `time.sleep()` when `stop` is `None`, otherwise `stop.wait()`, raising the internal `_FetchCancelled` (not a `CDXAPIError`) once `stop` is set |
+| `_RateLimiter(interval).wait(stop=None) -> None` | Spaces calls at least `interval` seconds apart across threads (reserves a slot under a lock, waits outside it with `_pause`, so a set `stop` raises `_FetchCancelled` without waiting). The module-level `_CDX_LIMITER` uses `CDX_REQUEST_INTERVAL` (3.0 s) and is shared by every CDX request |
 | `make_session() -> requests.Session` | Creates a retrying `Session` (exponential backoff on 429/5xx) |
 | `_cdx_params(target_url, *, page=None, page_size=None, resume_key=None, limit=None, collapse=None) -> dict[str, Any]` | Builds request parameters shared by both fetch paths. `collapse` is `urlkey` for lenient and `original` for strict. `limit` is used only by the sequential resumeKey path |
 | `_split_resume_key(data: list) -> tuple[list, str \| None]` | Splits a trailing resumeKey off the raw response. Only the documented `[..., [], ["<resumeKey>"]]` pattern is recognised, so `fl=original` single-column data rows are never mistaken for it; callers remove empty rows only after this split |
 | `_strip_header(data: list) -> list` | Removes the header row (`urlkey`/`original`) at the start of a chunk |
-| `_get_with_retries(session, api_url, params, headers, timeout=60) -> Response` | GET with up to 3 retries, also detecting empty/non-JSON responses. Calls `_CDX_LIMITER.wait()` before each attempt |
+| `_get_with_retries(session, api_url, params, headers, timeout=60, stop=None) -> Response` | GET with up to 3 retries, also detecting empty/non-JSON responses. Calls `_CDX_LIMITER.wait(stop)` before each attempt and waits between retries with `_pause`. Once `stop` is set (checked after the limiter wait, after the response, and on a request error), raises `_FetchCancelled` without sending, retrying, or logging a warning; a request already in progress is not interrupted |
 | `get_num_pages(target_url, page_size, collapse, session, headers) -> int \| None` | Fetches the total page count via `showNumPages`. Sends the same `pageSize`/`collapse` as page fetches (the count must use the same query shape; returns `None` when unsupported). Calls `_CDX_LIMITER.wait()` before the request |
-| `fetch_page_rows(target_url, page, page_size, collapse, session, headers) -> list[list]` | Fetches one page (follows in-page resumeKey chaining when the server returns one; `limit` is not sent) |
+| `fetch_page_rows(target_url, page, page_size, collapse, session, headers, stop=None) -> list[list]` | Fetches one page (follows in-page resumeKey chaining when the server returns one; `limit` is not sent). Passes `stop` to `_get_with_retries` |
 | `fetch_resumekey_rows(target_url, initial_resume_key, limit, collapse, session, headers) -> Generator` | Generator for sequential resumeKey fetching (`limit` is the chunk size). Ends normally only when a response carries no resumeKey; a chunk with a resumeKey but no data rows is followed, and a repeated resumeKey raises `CDXAPIError`. A failed request raises `ResumeKeyRequestError` (a `CDXAPIError` subclass carrying the key of the failed request); it does not log the key itself |
 | `_rows_to_keys(rows, key_opts) -> list[str]` | Converts CDX rows (`fl=original`) into a list of surt keys (`original` spellings are not stored) |
-| `_fetch_pages_parallel(target_url, pages, page_size, key_opts, workers, headers, collapse) -> Generator[tuple[int, list[str]]]` | Fetches the given pages in a thread pool and yields `(page, keys)` as they complete |
+| `_fetch_pages_parallel(target_url, pages, page_size, key_opts, workers, headers, collapse) -> Generator[tuple[int, list[str]]]` | Fetches the given pages in a thread pool and yields `(page, keys)` as they complete. Waits with `concurrent.futures.wait(FIRST_COMPLETED)` in polls of `FETCH_POLL_INTERVAL` (0.5 s) so Ctrl+C is noticed on Windows. Pages completed in the same poll are yielded in page order; if one of them failed, the workers are stopped before the successful ones are yielded, and the failure is raised after them. Workers share one stop event, passed to `fetch_page_rows(..., stop=)`. On any exit other than normal completion (failed page, `close()`, Ctrl+C), cancels the queued pages, then sets the stop event (see [Stopping a pagination fetch](#stopping-a-pagination-fetch)) |
 
 ### Orchestration and matching
 
@@ -112,12 +113,33 @@ flowchart TD
 | `_store_resumekey_rows(conn, rows, key_opts) -> int` | Inserts the keys of `fetch_resumekey_rows` rows in batches and returns the count. Pending keys are flushed on every exit (including errors and Ctrl+C). After a failed request (`ResumeKeyRequestError`), the failed request's key is stored in `meta.resume_key` only after the flush succeeds, before the error propagates. The CLI decides whether the stored progress can be resumed. If the flush or checkpoint write fails, the `sqlite3` error propagates and no resumeKey is logged |
 | `count_input_lines(input_file: str) -> int \| None` | Counts total lines quickly for the `scan_input_against_db` progress bar (returns `None` on failure) |
 | `scan_input_against_db(input_file, db_path, key_opts=None, output_file=None, output_archived=None, batch_size=LOOKUP_BATCH_SIZE) -> tuple[int, int, int]` | Streams, keys, batch-queries, and incrementally writes the input, returning `(total, not archived, archived)` (production path) |
-| `main() -> int` | CLI entry point (argument parsing, `build_key_opts`, DB setup, matching, exit code). Validates the entire input file as UTF-8 in bounded chunks before cache setup or CDX requests. Rejects `--resume-key` combined with `--no-cache` or `--refresh`. On a failed resumeKey request, suggests a key only with persistent progress and a nonempty key; otherwise suggests re-running from the beginning |
+| `main() -> int` | CLI entry point (argument parsing, `build_key_opts`, DB setup, matching, exit code). Validates the entire input file as UTF-8 in bounded chunks before cache setup or CDX requests. Rejects `--resume-key` combined with `--no-cache` or `--refresh`. On a failed resumeKey request, suggests a key only with persistent progress and a nonempty key; otherwise suggests re-running from the beginning. On Ctrl+C, logs `Interrupted. Re-run the same command to resume.` and returns 130. With `--refresh`, it asks to remove `--refresh` before re-running instead (re-running with it would delete the retained cache); with `--no-cache`, it suggests starting from the beginning and omitting `--no-cache` on future runs |
 
 Pagination progress reads the existing archived count once before fetching, then
 adds the `conn.total_changes` delta around each `insert_urls()` call. This counts
 only new keys (not duplicates or page metadata writes), including when resuming
 an incomplete cache. The final success log reads the count once more.
+
+### Stopping a pagination fetch
+
+When a page fails, the consumer closes the generator, or Ctrl+C arrives,
+`_fetch_pages_parallel` stops the remaining work instead of fetching every
+queued page:
+
+1. `ex.shutdown(wait=False, cancel_futures=True)` cancels the queued pages,
+   so no worker picks up another one. When a failed page completes in the
+   same poll as successful ones, steps 1 and 2 run before those pages are
+   yielded; they run only once.
+2. The shared stop event is set. Workers waiting on the rate limiter or
+   between retries wake at once and end with `_FetchCancelled`; a request
+   already in progress finishes first (up to about 4 minutes with urllib3
+   retries), and its result is discarded.
+3. The exception propagates. Pages already stored stay in `pages_done`,
+   `completed` stays 0, and the next run fetches only the missing pages.
+
+`ensure_archived_db` needs no extra handling: when an exception leaves its
+`for` loop (for example Ctrl+C during `insert_urls`), CPython closes the
+generator, which runs the same steps.
 
 ### Test and small-scale helpers
 
