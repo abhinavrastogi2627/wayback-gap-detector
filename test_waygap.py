@@ -560,6 +560,25 @@ class TestDetectNotArchived(unittest.TestCase):
         self.assertEqual(total_count, 3)
         self.assertEqual(len(not_archived), 2)
 
+    def test_utf8_bom_is_not_part_of_first_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_file = Path(directory) / "urls.txt"
+            input_file.write_bytes(
+                b"\xef\xbb\xbfhttps://example.com/page1\nhttps://example.com/page2\n"
+            )
+            archived_keys = {
+                normalize_key("https://example.com/page1"),
+                normalize_key("https://example.com/page2"),
+            }
+            not_archived, archived, total_count = detect_not_archived(
+                str(input_file), archived_keys, collect_archived=True
+            )
+        self.assertEqual(not_archived, [])
+        self.assertEqual(
+            archived, ["https://example.com/page1", "https://example.com/page2"]
+        )
+        self.assertEqual(total_count, 2)
+
 
 class TestIntegration(unittest.TestCase):
     """Integration test: extract keys then detect unarchived URLs."""
@@ -732,6 +751,40 @@ class TestSQLiteCache(unittest.TestCase):
         finally:
             if os.path.exists(db_path):
                 os.unlink(db_path)
+
+    def test_scan_strips_utf8_bom_from_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = os.path.join(directory, "cache.db")
+            conn = open_db(db_path)
+            try:
+                insert_urls(
+                    conn,
+                    [
+                        normalize_key("https://example.com/a"),
+                        normalize_key("https://example.com/b"),
+                    ],
+                )
+            finally:
+                conn.close()
+
+            input_file = Path(directory) / "urls.txt"
+            input_file.write_bytes(
+                b"\xef\xbb\xbfhttps://example.com/a\nhttps://example.com/b\n"
+            )
+            out_file = Path(directory) / "not_archived.txt"
+            arch_file = Path(directory) / "archived.txt"
+            result = scan_input_against_db(
+                str(input_file),
+                db_path,
+                output_file=str(out_file),
+                output_archived=str(arch_file),
+            )
+            self.assertEqual(result, (2, 0, 2))
+            self.assertEqual(out_file.read_bytes(), b"")
+            self.assertEqual(
+                arch_file.read_text(encoding="utf-8").splitlines(),
+                ["https://example.com/a", "https://example.com/b"],
+            )
 
 
 class TestCdxRateLimiter(unittest.TestCase):
@@ -1612,6 +1665,8 @@ class TestMainInputValidation(unittest.TestCase):
             input_file = Path(directory) / "urls.txt"
             cases = {
                 "utf16": "https://example.com/\n".encode("utf-16"),
+                "bom_first_byte_only": b"\xef",
+                "bom_first_two_bytes_only": b"\xef\xbb",
                 "invalid_after_first_chunk": (
                     b"https://example.com/\n" * 100_000 + b"https://example.com/\x82\n"
                 ),
