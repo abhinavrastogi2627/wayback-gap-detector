@@ -815,6 +815,8 @@ def _fetch_pages_parallel(
 ) -> Generator[tuple[int, list[str]], None, None]:
     """Fetch pages concurrently; yields (page, surt_keys) as they complete.
 
+    At most twice the worker count is submitted at a time; consumed page
+    results are released before more pages are yielded.
     Pages completed in the same wait are yielded in page order. If one of
     them failed, the workers are stopped before the successful ones are
     yielded, and the failure is raised after them. When the
@@ -839,29 +841,47 @@ def _fetch_pages_parallel(
         )
         return page, _rows_to_keys(rows, key_opts)
 
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers))
+    workers = max(1, workers)
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    remaining = iter(pages)
+    pending: dict[concurrent.futures.Future[tuple[int, list[str]]], int] = {}
     try:
-        futures = {ex.submit(_work, p): p for p in pages}
-        pending = set(futures)
-        while pending:
+        while True:
+            while len(pending) < workers * 2:
+                page = next(remaining, None)
+                if page is None:
+                    break
+                pending[ex.submit(_work, page)] = page
+            if not pending:
+                break
             # A timed wait, so Ctrl+C is noticed on Windows (see
             # FETCH_POLL_INTERVAL).
-            done, pending = concurrent.futures.wait(
+            done, _ = concurrent.futures.wait(
                 pending,
                 timeout=FETCH_POLL_INTERVAL,
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
-            ordered = sorted(done, key=lambda f: futures[f])
-            errors = [exc for f in ordered if (exc := f.exception()) is not None]
+            ordered = sorted(done, key=lambda f: pending[f], reverse=True)
+            del done
+            errors = [
+                exc for f in reversed(ordered) if (exc := f.exception()) is not None
+            ]
             if errors:
                 # Stop before yielding the successful pages of this wait, so
                 # workers do not fetch more pages while the consumer stores
                 # them. Cancel first, as below.
                 ex.shutdown(wait=False, cancel_futures=True)
                 stop.set()
-            for fut in ordered:
+            while ordered:
+                fut = ordered.pop()
+                del pending[fut]
                 if fut.exception() is None:
-                    yield fut.result()
+                    result = fut.result()
+                    del fut
+                    yield result
+                    del result
+                else:
+                    del fut
             if errors:
                 raise errors[0]
     except BaseException:

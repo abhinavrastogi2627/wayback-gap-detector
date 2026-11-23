@@ -84,7 +84,7 @@ flowchart TD
 | `fetch_page_rows` | Fetches one page |
 | `fetch_resumekey_rows` | Generator for sequential resumeKey fetching. Ends normally only when a response carries no resumeKey. A failed request raises `ResumeKeyRequestError` (a `CDXAPIError` subclass carrying the key of the failed request) |
 | `_rows_to_keys` | Converts CDX rows into a list of surt keys |
-| `_fetch_pages_parallel` | Fetches the given pages in a thread pool and yields `(page, keys)` as they complete (see [Stopping a pagination fetch](#stopping-a-pagination-fetch)) |
+| `_fetch_pages_parallel` | Fetches the given pages in a thread pool, keeping only a bounded number of pages in flight, and yields `(page, keys)` as they complete (see [Stopping a pagination fetch](#stopping-a-pagination-fetch)) |
 
 ### Orchestration and matching
 
