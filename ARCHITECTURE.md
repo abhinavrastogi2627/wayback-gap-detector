@@ -18,34 +18,34 @@ Page-count queries (`showNumPages`) send the same `pageSize` and `collapse` as p
 
 ```mermaid
 flowchart TD
-    CLI["CLI arguments\ntarget_url / --input / --output / --cache\nkey_opts = build_key_opts(ignore_protocol, ignore_www)"] --> INPUT["Validate --input as UTF-8 in chunks"]
-    INPUT --> ENSURE["ensure_archived_db\nbuild / reuse / resume cache\n(records key_profile in meta)"]
+    CLI["CLI arguments\nbuild_key_opts"] --> INPUT["Validate --input as UTF-8"]
+    INPUT --> ENSURE["ensure_archived_db"]
 
     subgraph FETCH["CDX fetch phase"]
-        ENSURE --> META{"meta check\ncompleted=1?"}
-        META -- "no --resume-key:\nmatch + complete\n(not an older resumeKey cache)" --> REUSE["Reuse cache\nno API calls"]
+        ENSURE --> META{"meta check"}
+        META -- "no --resume-key:\nmatch + complete" --> REUSE["Reuse cache\nno API calls"]
         META -- "no --resume-key:\nmismatch" --> REBUILD["Rebuild DB"]
-        META -- "no --resume-key:\nmatch + incomplete, or resumeKey cache\ncompleted by an older version" --> RESUME["Resume missing pages"]
-        META -- "--resume-key: cache missing,\nmismatched, complete, pagination,\nor unverified checkpoint" --> REJECT["CacheError\ncache not deleted or overwritten"]
-        META -- "--resume-key: match + incomplete,\nverified checkpoint matches" --> SEQ
+        META -- "no --resume-key:\nmatch + incomplete" --> RESUME["Resume missing pages"]
+        META -- "--resume-key:\nverified checkpoint matches" --> SEQ
+        META -- "--resume-key:\notherwise" --> REJECT["CacheError\ncache not deleted or overwritten"]
         REBUILD --> NUM{"get_num_pages\nshowNumPages"}
         RESUME --> NUM
         NUM -- "page count available" --> PAR["fetch_page_rows × workers\n_fetch_pages_parallel"]
-        NUM -- "unsupported" --> SEQ["fetch_resumekey_rows\nsequential\n(repeated resumeKey → error, completed stays 0)"]
+        NUM -- "unsupported" --> SEQ["fetch_resumekey_rows\nsequential"]
         PAR --> NORM["_rows_to_keys\nnormalize_key (surt)"]
-        NORM --> INS["insert_urls\nINSERT OR IGNORE (key)"]
+        NORM --> INS["insert_urls"]
         INS --> DONE_PAGES["mark_page_done\nset_completed"]
-        SEQ --> STORE["_store_resumekey_rows\nnormalize_key + insert_urls\n(pending keys flushed on every exit)"]
+        SEQ --> STORE["_store_resumekey_rows\nnormalize_key + insert_urls"]
         STORE -- "generator ended normally" --> SEQ_DONE["set_completed"]
     end
 
-    REUSE --> SCAN["scan_input_against_db\nstream input matching\n(keyed by normalize_key)"]
+    REUSE --> SCAN["scan_input_against_db\n(keyed by normalize_key)"]
     DONE_PAGES --> SCAN
     SEQ_DONE --> SCAN
 
     subgraph CHECK["Matching phase (low memory)"]
-        SCAN --> BATCH["batch_lookup_found\n500 keys per WHERE IN query"]
-        BATCH --> W1["not_archived.txt\nappended incrementally"]
+        SCAN --> BATCH["batch_lookup_found"]
+        BATCH --> W1["not_archived.txt"]
         BATCH --> W2["archived.txt\nonly with --output-archived"]
     end
 ```
@@ -54,7 +54,7 @@ flowchart TD
 
 | Table | Definition | Purpose |
 |---|---|---|
-| `meta` | `(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID` | Run parameters, `key_profile`, `completed` flag, `mode`, `resume_key`, etc. Rebuilt automatically when parameters differ |
+| `meta` | `(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID` | Run parameters, `key_profile`, `completed` flag, `mode`, `resume_key`, etc. Rebuilt automatically when parameters differ. `completed` is set to 1 only after the whole fetch finishes, so an interrupted fetch is never reused as complete |
 | `archived` | `(key TEXT PRIMARY KEY) WITHOUT ROWID` | Set of surt keys only (`original` is not stored) |
 | `pages_done` | `(page INTEGER PRIMARY KEY)` | Fetched page numbers. On interruption, only missing pages are fetched again |
 
@@ -99,20 +99,10 @@ flowchart TD
 ### Stopping a pagination fetch
 
 When a page fails, the consumer closes the generator, or Ctrl+C arrives,
-`_fetch_pages_parallel` stops the remaining work instead of fetching every
-queued page:
-
-1. `ex.shutdown(wait=False, cancel_futures=True)` cancels the queued pages,
-   so no worker picks up another one. When a failed page completes in the
-   same poll as successful ones, steps 1 and 2 run before those pages are
-   yielded; they run only once.
-2. The shared stop event is set. Workers waiting on the rate limiter or
-   between retries wake at once and end with `_FetchCancelled`; a request
-   already in progress finishes first (up to about 4 minutes with urllib3
-   retries), and its result is discarded.
-3. The exception propagates. Pages already stored stay in `pages_done`,
-   `completed` stays 0, and the next run fetches only the missing pages.
+`_fetch_pages_parallel` cancels the queued pages and sets a shared stop event:
+workers waiting on the rate limiter or between retries end at once, and a
+request already in progress finishes and its result is discarded.
 
 `ensure_archived_db` needs no extra handling: when an exception leaves its
 `for` loop (for example Ctrl+C during `insert_urls`), CPython closes the
-generator, which runs the same steps.
+generator, which stops the work the same way.
