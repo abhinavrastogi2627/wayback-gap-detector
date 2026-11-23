@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Wayback Gap Detector - Unit Tests
 Tests for each feature of waygap.py.
@@ -2586,48 +2585,3 @@ class TestVersion(unittest.TestCase):
 
     def test_user_agent_contains_version(self):
         self.assertIn(f"Wayback-Gap-Detector/{__version__}", USER_AGENT)
-
-
-def run_tests():
-    """Discover and run all test cases."""
-    loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-
-    suite.addTests(loader.loadTestsFromTestCase(TestBuildKeyOpts))
-    suite.addTests(loader.loadTestsFromTestCase(TestNormalizeKey))
-    suite.addTests(loader.loadTestsFromTestCase(TestNormalizeKeyStrict))
-    suite.addTests(loader.loadTestsFromTestCase(TestCdxParams))
-    suite.addTests(loader.loadTestsFromTestCase(TestExtractArchivedUrls))
-    suite.addTests(loader.loadTestsFromTestCase(TestExceptions))
-    suite.addTests(loader.loadTestsFromTestCase(TestDetectNotArchived))
-    suite.addTests(loader.loadTestsFromTestCase(TestIntegration))
-    suite.addTests(loader.loadTestsFromTestCase(TestAdditionalFeatures))
-    suite.addTests(loader.loadTestsFromTestCase(TestSplitResumeKey))
-    suite.addTests(loader.loadTestsFromTestCase(TestSQLiteCache))
-    suite.addTests(loader.loadTestsFromTestCase(TestFetchPageRowsChaining))
-    suite.addTests(loader.loadTestsFromTestCase(TestFetchResumeKeyRows))
-    suite.addTests(loader.loadTestsFromTestCase(TestResumeKeyCache))
-    suite.addTests(loader.loadTestsFromTestCase(TestMainResumeKeyOptions))
-    suite.addTests(loader.loadTestsFromTestCase(TestCDXPaginationDB))
-    suite.addTests(loader.loadTestsFromTestCase(TestParallelFetchMemory))
-    suite.addTests(loader.loadTestsFromTestCase(TestVersion))
-
-    runner = unittest.TextTestRunner(verbosity=2)
-    result = runner.run(suite)
-
-    return result
-
-
-if __name__ == "__main__":
-    result = run_tests()
-
-    print("\n" + "=" * 70)
-    print("Test Result Summary")
-    print("=" * 70)
-    print(f"Tests run:  {result.testsRun}")
-    print(f"Passed:     {result.testsRun - len(result.failures) - len(result.errors)}")
-    print(f"Failed:     {len(result.failures)}")
-    print(f"Errors:     {len(result.errors)}")
-    print("=" * 70)
-
-    exit(0 if result.wasSuccessful() else 1)
