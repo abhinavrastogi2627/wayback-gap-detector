@@ -67,6 +67,7 @@ flowchart TD
 | `build_key_opts` | surt options for a run |
 | `key_profile` | Stable fingerprint for cache identity (e.g. `surt-default` / `surt:host_massage=False`) |
 | `normalize_key` | Converts a URL to a surt key |
+| `_try_normalize_key` | Wraps `normalize_key` for every caller; returns `None` for a URL that surt cannot parse, so the CDX row is skipped and the input line is reported as unarchived |
 | `canonicalize_nodns` | Copy of surt.GoogleURLCanonicalizer.canonicalize. Only `attemptIPFormats()` is replaced with a DNS-free variant (removing `socket.gethostbyname_ex` for numerically shaped hosts). Byte-identical to the default canonicalizer for ordinary hosts |
 
 ### CDX API layer
