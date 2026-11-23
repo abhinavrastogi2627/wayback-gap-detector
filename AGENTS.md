@@ -26,7 +26,10 @@ All of these must pass before a change is complete (CI runs the same commands).
   `requirements.txt` together. Regenerate `requirements.txt` with
   `uv export --no-dev --no-hashes --no-emit-project -o requirements.txt`.
 - Keep `README.md` and `README_ja.md` in sync; update both together.
-- Update `ARCHITECTURE.md` when functions or the data flow change.
+- `ARCHITECTURE.md` covers the data flow, the cache schema, rules that span
+  functions, and one-line roles of the key functions; update it when those
+  change. Keep function-level details (signatures, edge cases, log wording,
+  retry counts) in docstrings and comments.
 
 ## Commits
 

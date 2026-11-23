@@ -74,8 +74,12 @@ reviews:
         mode: "warning"
         instructions: |
           If README.md or README_ja.md changes, the other must be updated with
-          equivalent content. If functions, signatures, or the data flow in
-          waygap.py change, ARCHITECTURE.md must be updated accordingly.
+          equivalent content. If the data flow, the cache schema, rules that
+          span functions, or the roles of the key functions in waygap.py
+          change, ARCHITECTURE.md must be updated accordingly. A change must
+          not add function-level details (signatures, edge cases, log wording,
+          retry counts) to ARCHITECTURE.md; they belong in docstrings and
+          comments.
       - name: "Dependencies in sync"
         mode: "warning"
         instructions: |
