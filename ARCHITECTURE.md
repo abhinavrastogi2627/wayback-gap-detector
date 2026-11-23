@@ -32,14 +32,14 @@ flowchart TD
         RESUME --> NUM
         NUM -- "page count available" --> PAR["fetch_page_rows × workers\n_fetch_pages_parallel\n(lenient: collapse=urlkey / strict: collapse=original)\n(shared 3 s request interval)"]
         NUM -- "unsupported" --> SEQ["fetch_resumekey_rows\nsequential\n(repeated resumeKey → error, completed stays 0)"]
-        PAR --> NORM["_rows_to_keys\nnormalize_key (surt)"]
+        PAR --> NORM["_rows_to_keys\n_try_normalize_key (surt)\n(unparsable rows skipped)"]
         NORM --> INS["insert_urls\nINSERT OR IGNORE (key)"]
         INS --> DONE_PAGES["mark_page_done\nset_completed"]
-        SEQ --> STORE["_store_resumekey_rows\nnormalize_key + insert_urls\n(pending keys flushed on every exit)"]
+        SEQ --> STORE["_store_resumekey_rows\n_try_normalize_key + insert_urls\n(unparsable rows skipped,\npending keys flushed on every exit)"]
         STORE -- "generator ended normally" --> SEQ_DONE["set_completed"]
     end
 
-    REUSE --> SCAN["scan_input_against_db\nstream input matching\n(keyed by normalize_key)"]
+    REUSE --> SCAN["scan_input_against_db\nstream input matching\n(keyed by _try_normalize_key;\nunparsable lines → not archived)"]
     DONE_PAGES --> SCAN
     SEQ_DONE --> SCAN
 
@@ -67,6 +67,7 @@ flowchart TD
 | `build_key_opts(ignore_protocol: bool, ignore_www: bool) -> dict[str, Any]` | surt options for a run. Both defaults (True/True) yield an empty dict == surt defaults == CDX `urlkey` family. `--no-ignore-www` → `host_massage=False`; `--no-ignore-protocol` → `with_scheme=True` (activates strict mode) |
 | `key_profile(opts: dict[str, Any]) -> str` | Stable fingerprint for cache identity (e.g. `surt-default` / `surt:host_massage=False`) |
 | `normalize_key(url: str, key_opts=None) -> str` | Converts a URL to a surt key. Empty/blank-only input maps to the sentinel `"-"`. In strict mode with the scheme preserved, only the input scheme is lowercased locally (surt reproduces the input scheme's case as-is) |
+| `_try_normalize_key(url: str, key_opts, context: str) -> str \| None` | `normalize_key`, but returns `None` and logs a warning (with `context` and the URL) when surt raises `ValueError` (an invalid port, or `UnicodeEncodeError` for a lone surrogate). Every caller below uses it, so one unparsable URL does not stop the run |
 | `canonicalize_nodns(url, **_ignored)` | Copy of surt.GoogleURLCanonicalizer.canonicalize. Only `attemptIPFormats()` is replaced with a DNS-free variant (removing `socket.gethostbyname_ex` for numerically shaped hosts). Byte-identical to the default canonicalizer for ordinary hosts |
 | `attemptIPFormats_nodns(host)` | All-digit hosts are converted locally (`inet_ntoa`); valid IPv4 quads pass through; octal/invalid numeric-dotted hosts pass through (same behavior as surt when DNS fails, with no network access) |
 | `KEY_CANONICALIZER` | `CompositeCanonicalizer([canonicalize_nodns, ia_canonicalize])`. Flags apply only to the IA stage (same shape as the default canonicalizer) |
@@ -102,7 +103,7 @@ flowchart TD
 | `get_num_pages(target_url, page_size, collapse, session, headers) -> int \| None` | Fetches the total page count via `showNumPages`. Sends the same `pageSize`/`collapse` as page fetches (the count must use the same query shape; returns `None` when unsupported). Calls `_CDX_LIMITER.wait()` before the request |
 | `fetch_page_rows(target_url, page, page_size, collapse, session, headers, stop=None) -> list[list]` | Fetches one page (follows in-page resumeKey chaining when the server returns one; `limit` is not sent). Passes `stop` to `_get_with_retries` |
 | `fetch_resumekey_rows(target_url, initial_resume_key, limit, collapse, session, headers) -> Generator` | Generator for sequential resumeKey fetching (`limit` is the chunk size). Ends normally only when a response carries no resumeKey; a chunk with a resumeKey but no data rows is followed, and a repeated resumeKey raises `CDXAPIError`. A failed request raises `ResumeKeyRequestError` (a `CDXAPIError` subclass carrying the key of the failed request); it does not log the key itself |
-| `_rows_to_keys(rows, key_opts) -> list[str]` | Converts CDX rows (`fl=original`) into a list of surt keys (`original` spellings are not stored) |
+| `_rows_to_keys(rows, key_opts) -> list[str]` | Converts CDX rows (`fl=original`) into a list of surt keys (`original` spellings are not stored). Rows whose URL surt cannot parse are skipped with a warning, so the page still completes |
 | `_fetch_pages_parallel(target_url, pages, page_size, key_opts, workers, headers, collapse) -> Generator[tuple[int, list[str]]]` | Fetches the given pages in a thread pool and yields `(page, keys)` as they complete. Waits with `concurrent.futures.wait(FIRST_COMPLETED)` in polls of `FETCH_POLL_INTERVAL` (0.5 s) so Ctrl+C is noticed on Windows. Pages completed in the same poll are yielded in page order; if one of them failed, the workers are stopped before the successful ones are yielded, and the failure is raised after them. Workers share one stop event, passed to `fetch_page_rows(..., stop=)`. On any exit other than normal completion (failed page, `close()`, Ctrl+C), cancels the queued pages, then sets the stop event (see [Stopping a pagination fetch](#stopping-a-pagination-fetch)) |
 
 ### Orchestration and matching
@@ -110,9 +111,9 @@ flowchart TD
 | Signature | Description |
 |---|---|
 | `ensure_archived_db(target_url, cache_file, key_opts=None, initial_resume_key=None, limit=None, page_size=None, workers=2, refresh=False) -> str` | Determines reuse/resume/rebuild (including profile or column-layout mismatches) and builds the DB, returning its path. Sends `collapse=urlkey` for lenient / `collapse=original` for strict (with tqdm progress). With `initial_resume_key`, raises `CacheError` unless the cache file exists, matches the current settings, is incomplete, is not a pagination cache, and the key matches its saved `resume_key` under the current fetch version. In the resumeKey path, sets `completed=1` only after the fetch reached the end. A completed `mode=resumekey` cache without the current `resumekey_v` (completed by an older version) is not reused: it is marked incomplete and fetched again from the beginning |
-| `_store_resumekey_rows(conn, rows, key_opts) -> int` | Inserts the keys of `fetch_resumekey_rows` rows in batches and returns the count. Pending keys are flushed on every exit (including errors and Ctrl+C). After a failed request (`ResumeKeyRequestError`), the failed request's key is stored in `meta.resume_key` only after the flush succeeds, before the error propagates. The CLI decides whether the stored progress can be resumed. If the flush or checkpoint write fails, the `sqlite3` error propagates and no resumeKey is logged |
+| `_store_resumekey_rows(conn, rows, key_opts) -> int` | Inserts the keys of `fetch_resumekey_rows` rows in batches and returns the count. Rows whose URL surt cannot parse are skipped with a warning and not counted. Pending keys are flushed on every exit (including errors and Ctrl+C). After a failed request (`ResumeKeyRequestError`), the failed request's key is stored in `meta.resume_key` only after the flush succeeds, before the error propagates. The CLI decides whether the stored progress can be resumed. If the flush or checkpoint write fails, the `sqlite3` error propagates and no resumeKey is logged |
 | `count_input_lines(input_file: str) -> int \| None` | Counts total lines quickly for the `scan_input_against_db` progress bar (returns `None` on failure) |
-| `scan_input_against_db(input_file, db_path, key_opts=None, output_file=None, output_archived=None, batch_size=LOOKUP_BATCH_SIZE) -> tuple[int, int, int]` | Streams, keys, batch-queries, and incrementally writes the input, returning `(total, not archived, archived)` (production path). A leading UTF-8 BOM in the input is ignored |
+| `scan_input_against_db(input_file, db_path, key_opts=None, output_file=None, output_archived=None, batch_size=LOOKUP_BATCH_SIZE) -> tuple[int, int, int]` | Streams, keys, batch-queries, and incrementally writes the input, returning `(total, not archived, archived)` (production path). A leading UTF-8 BOM in the input is ignored. A line whose URL surt cannot parse is logged as a warning with its line number and counted and written as not archived |
 | `main() -> int` | CLI entry point (argument parsing, `build_key_opts`, DB setup, matching, exit code). Validates the entire input file as UTF-8 (a leading BOM is allowed) in bounded chunks before cache setup or CDX requests. Rejects `--resume-key` combined with `--no-cache` or `--refresh`. On a failed resumeKey request, suggests a key only with persistent progress and a nonempty key; otherwise suggests re-running from the beginning. On Ctrl+C, logs `Interrupted. Re-run the same command to resume.` and returns 130. With `--refresh`, it asks to remove `--refresh` before re-running instead (re-running with it would delete the retained cache); with `--no-cache`, it suggests starting from the beginning and omitting `--no-cache` on future runs |
 
 Pagination progress reads the existing archived count once before fetching, then
@@ -145,5 +146,5 @@ generator, which runs the same steps.
 
 | Signature | Description |
 |---|---|
-| `extract_archived_urls(cdx_data, key_opts=None) -> set[str]` | In-memory extraction for small-scale/test use (locates the `original` column from the header and returns a set of surt keys; malformed headers yield an empty set) |
-| `detect_not_archived(input_file, archived_keys: set[str], key_opts=None, collect_archived=False) -> tuple[list, list \| None, int]` | In-memory matching for small-scale/test use (keys each line with `normalize_key`; a leading UTF-8 BOM is ignored). The production path uses `scan_input_against_db` |
+| `extract_archived_urls(cdx_data, key_opts=None) -> set[str]` | In-memory extraction for small-scale/test use (locates the `original` column from the header and returns a set of surt keys; malformed headers yield an empty set; rows whose URL surt cannot parse are skipped with a warning) |
+| `detect_not_archived(input_file, archived_keys: set[str], key_opts=None, collect_archived=False) -> tuple[list, list \| None, int]` | In-memory matching for small-scale/test use (keys each line with `_try_normalize_key`, reporting an unparsable line as not archived; a leading UTF-8 BOM is ignored). The production path uses `scan_input_against_db` |
