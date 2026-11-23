@@ -78,8 +78,8 @@ reviews:
           span functions, or the roles of the key functions in waygap.py
           change, ARCHITECTURE.md must be updated accordingly. A change must
           not add function-level details (signatures, edge cases, log wording,
-          retry counts) to ARCHITECTURE.md; they belong in docstrings and
-          comments.
+          retry counts) to ARCHITECTURE.md; leave them to the code, with
+          docstrings or comments only where the code alone is unclear.
       - name: "Dependencies in sync"
         mode: "warning"
         instructions: |

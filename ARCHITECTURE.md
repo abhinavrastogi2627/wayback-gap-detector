@@ -74,7 +74,7 @@ flowchart TD
 | Function | Description |
 |---|---|
 | `_pause` | Waits for `seconds`, raising the internal `_FetchCancelled` once `stop` is set |
-| `_RateLimiter.wait` | Spaces calls at least `interval` seconds apart across threads. The module-level `_CDX_LIMITER` uses `CDX_REQUEST_INTERVAL` (3.0 s) and is shared by every CDX request |
+| `_RateLimiter.wait` | Spaces calls at least `interval` seconds apart across threads. The module-level `_CDX_LIMITER` is shared by every CDX request |
 | `make_session` | Creates a retrying `Session` |
 | `_cdx_params` | Builds request parameters shared by both fetch paths |
 | `_split_resume_key` | Splits a trailing resumeKey off the raw response |
@@ -82,7 +82,7 @@ flowchart TD
 | `_get_with_retries` | GET with retries, also detecting empty/non-JSON responses |
 | `get_num_pages` | Fetches the total page count via `showNumPages` |
 | `fetch_page_rows` | Fetches one page |
-| `fetch_resumekey_rows` | Generator for sequential resumeKey fetching. Ends normally only when a response carries no resumeKey. A failed request raises `ResumeKeyRequestError` (a `CDXAPIError` subclass carrying the key of the failed request) |
+| `fetch_resumekey_rows` | Generator for sequential resumeKey fetching |
 | `_rows_to_keys` | Converts CDX rows into a list of surt keys |
 | `_fetch_pages_parallel` | Fetches the given pages in a thread pool, keeping only a bounded number of pages in flight, and yields `(page, keys)` as they complete (see [Stopping a pagination fetch](#stopping-a-pagination-fetch)) |
 
@@ -93,7 +93,7 @@ flowchart TD
 | `ensure_archived_db` | Determines reuse/resume/rebuild (including profile or column-layout mismatches) and builds the DB, returning its path |
 | `_store_resumekey_rows` | Inserts the keys of `fetch_resumekey_rows` rows in batches and returns the count. After a failed request (`ResumeKeyRequestError`), the failed request's key is stored in `meta.resume_key` |
 | `count_input_lines` | Counts total lines quickly for the `scan_input_against_db` progress bar |
-| `scan_input_against_db` | Streams, keys, batch-queries, and incrementally writes the input, returning `(total, not archived, archived)`. A leading UTF-8 BOM in the input is ignored |
+| `scan_input_against_db` | Streams, keys, batch-queries, and incrementally writes the input |
 | `main` | CLI entry point (argument parsing, `build_key_opts`, DB setup, matching, exit code) |
 
 ### Stopping a pagination fetch
