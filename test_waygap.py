@@ -10,7 +10,9 @@ where our keys intentionally diverge from surt's gethostbyname_ex path).
 """
 
 import _thread
+import concurrent.futures
 import contextlib
+import gc
 import io
 import json
 import os
@@ -20,6 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
+import weakref
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -2258,6 +2261,124 @@ class TestCDXPaginationDB(unittest.TestCase):
                 os.unlink(cache_path)
 
 
+class TestParallelFetchMemory(unittest.TestCase):
+    """Slow consumers must not retain every fetched page in memory."""
+
+    def test_slow_consumer_bounds_submitted_pages(self):
+        submitted: list[int] = []
+
+        class TrackingExecutor(concurrent.futures.ThreadPoolExecutor):
+            def submit(self, fn, /, *args, **kwargs):
+                submitted.append(args[0])
+                return super().submit(fn, *args, **kwargs)
+
+        with (
+            patch("waygap.concurrent.futures.ThreadPoolExecutor", TrackingExecutor),
+            patch("waygap.fetch_page_rows", return_value=[]),
+            _join_new_threads(),
+        ):
+            gen = TestParallelFetchStops._pages(100, 2)
+            try:
+                next(gen)
+                # The caller is paused here, as during a slow SQLite insert.
+                self.assertLessEqual(len(submitted), 4)
+            finally:
+                gen.close()
+
+    def test_consumed_page_results_are_released(self):
+        class Keys(list):
+            pass
+
+        def keys(rows, key_opts):
+            return Keys(["a.example)/"])
+
+        with (
+            patch("waygap.fetch_page_rows", return_value=[]),
+            patch("waygap._rows_to_keys", side_effect=keys),
+            _join_new_threads(),
+        ):
+            gen = TestParallelFetchStops._pages(100, 2)
+            try:
+                consumed = []
+                for _ in range(99):
+                    _, result = next(gen)
+                    consumed.append(weakref.ref(result))
+                    del result
+                next(gen)
+                gc.collect()
+                self.assertTrue(all(ref() is None for ref in consumed))
+            finally:
+                gen.close()
+
+    def test_yields_completed_page_without_waiting_for_earlier_page(self):
+        release = threading.Event()
+
+        def fetch(target_url, page, *args, **kwargs):
+            if page == 0:
+                self.assertTrue(release.wait(3))
+            return [[f"https://example.com/{page}"]]
+
+        with patch("waygap.fetch_page_rows", fetch), _join_new_threads():
+            gen = TestParallelFetchStops._pages(2, 2)
+            try:
+                self.assertEqual(
+                    next(gen), (1, [normalize_key("https://example.com/1")])
+                )
+                release.set()
+                self.assertEqual(
+                    list(gen), [(0, [normalize_key("https://example.com/0")])]
+                )
+            finally:
+                release.set()
+                gen.close()
+
+    def test_failed_batch_preserves_successes_without_submitting_more(self):
+        wait = concurrent.futures.wait
+        stops = []
+        fetched = []
+
+        def fetch(target_url, page, *args, **kwargs):
+            fetched.append(page)
+            stops.append(kwargs["stop"])
+            if page in (1, 2):
+                raise CDXAPIError(f"page {page} failed")
+            return []
+
+        def whole_batch(fs, **kwargs):
+            return wait(fs, timeout=3)
+
+        with (
+            patch("waygap.fetch_page_rows", fetch),
+            patch("waygap.concurrent.futures.wait", whole_batch),
+            _join_new_threads(),
+        ):
+            gen = TestParallelFetchStops._pages(100, 2)
+            try:
+                self.assertEqual(next(gen), (0, []))
+                self.assertTrue(all(stop.is_set() for stop in stops))
+                self.assertEqual(next(gen), (3, []))
+                with self.assertRaisesRegex(CDXAPIError, "page 1 failed"):
+                    next(gen)
+                self.assertEqual(sorted(fetched), [0, 1, 2, 3])
+            finally:
+                gen.close()
+
+    def test_empty_and_small_inputs(self):
+        with patch("waygap.fetch_page_rows", return_value=[]) as fetch:
+            for workers in (-1, 0, 1, 3):
+                for pages in ([], [8], [8, 3, 11]):
+                    with self.subTest(workers=workers, pages=pages):
+                        result = list(
+                            waygap._fetch_pages_parallel(
+                                TARGET, pages, None, None, workers, {}, None
+                            )
+                        )
+                        self.assertEqual(
+                            sorted(result), [(p, []) for p in sorted(pages)]
+                        )
+            self.assertEqual(fetch.call_count, 16)
+
+
 class TestParallelFetchStops(unittest.TestCase):
     """A failed page, close() or Ctrl+C stops the remaining page fetches."""
 
@@ -2674,6 +2795,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestResumeKeyCache))
     suite.addTests(loader.loadTestsFromTestCase(TestMainResumeKeyOptions))
     suite.addTests(loader.loadTestsFromTestCase(TestCDXPaginationDB))
+    suite.addTests(loader.loadTestsFromTestCase(TestParallelFetchMemory))
     suite.addTests(loader.loadTestsFromTestCase(TestVersion))
 
     runner = unittest.TextTestRunner(verbosity=2)
