@@ -2609,6 +2609,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestResumeKeyCache))
     suite.addTests(loader.loadTestsFromTestCase(TestMainResumeKeyOptions))
     suite.addTests(loader.loadTestsFromTestCase(TestCDXPaginationDB))
+    suite.addTests(loader.loadTestsFromTestCase(TestParallelFetchMemory))
     suite.addTests(loader.loadTestsFromTestCase(TestVersion))
 
     runner = unittest.TextTestRunner(verbosity=2)
