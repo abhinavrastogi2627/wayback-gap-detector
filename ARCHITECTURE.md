@@ -76,7 +76,9 @@ flowchart TD
 |---|---|
 | `_pause` | Waits for `seconds`, raising the internal `_FetchCancelled` once `stop` is set |
 | `_RateLimiter.wait` | Spaces calls at least `interval` seconds apart across threads. The module-level `_CDX_LIMITER` is shared by every CDX request |
-| `make_session` | Creates a retrying `Session` |
+| `_RateLimiter.pause` | Holds every caller's `wait()` for the given number of seconds |
+| `make_session` | Creates a `Session` that retries 5xx responses (HTTP 429 is left to `_cdx_get`) |
+| `_cdx_get` | Sends one GET through the shared limiter; on HTTP 429, pauses every CDX request before sending again |
 | `_cdx_params` | Builds request parameters shared by both fetch paths |
 | `_split_resume_key` | Splits a trailing resumeKey off the raw response |
 | `_strip_header` | Removes the header row (`urlkey`/`original`) at the start of a chunk |
@@ -101,8 +103,8 @@ flowchart TD
 
 When a page fails, the consumer closes the generator, or Ctrl+C arrives,
 `_fetch_pages_parallel` cancels the queued pages and sets a shared stop event:
-workers waiting on the rate limiter or between retries end at once, and a
-request already in progress finishes and its result is discarded.
+workers waiting on the rate limiter (including a pause after HTTP 429) or
+between retries end at once, and a request already in progress finishes and its result is discarded.
 
 `ensure_archived_db` needs no extra handling: when an exception leaves its
 `for` loop (for example Ctrl+C during `insert_urls`), CPython closes the
