@@ -145,6 +145,8 @@ https://example.com/blog/post-3
 
 Blank lines are ignored.
 
+A URL that cannot be converted into a surt key (for example, one with a port above 65535) does not stop the run. An input line with such a URL is logged as a warning with its line number and written to the unarchived output. A CDX row with such a URL is logged as a warning and skipped.
+
 ---
 
 ## How URLs are matched (surt keys)

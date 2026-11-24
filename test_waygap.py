@@ -2575,6 +2575,192 @@ class TestParallelFetchStops(unittest.TestCase):
         self.assertTrue(all(stops_set), stops_set)
 
 
+BAD_PORT_URL = "http://example.com:99999/"
+# A lone surrogate can come from a JSON escape in a CDX response; a UTF-8
+# input file cannot contain one.
+LONE_SURROGATE_URL = "http://a\udc80b.example/"
+
+
+class TestUnparsableUrls(unittest.TestCase):
+    """A URL that surt cannot parse must not stop the run (issue #14)."""
+
+    def test_try_normalize_key_returns_none_for_unparsable_urls(self):
+        for url in (BAD_PORT_URL, "http://example.com:abc/", LONE_SURROGATE_URL):
+            with (
+                self.subTest(url=url),
+                self.assertLogs("waygap", level="WARNING") as logs,
+            ):
+                self.assertIsNone(waygap._try_normalize_key(url, None, "in a test"))
+            self.assertIn(repr(url), "\n".join(logs.output))
+        self.assertEqual(
+            waygap._try_normalize_key("http://a.example/", None, "in a test"),
+            normalize_key("http://a.example/"),
+        )
+
+    def test_extract_skips_unparsable_rows(self):
+        cdx_data = [
+            ["http://a.example/"],
+            [BAD_PORT_URL],
+            [LONE_SURROGATE_URL],
+            ["http://b.example/"],
+        ]
+        with self.assertLogs("waygap", level="WARNING") as logs:
+            result = extract_archived_urls(cdx_data)
+        self.assertEqual(
+            result,
+            {normalize_key("http://a.example/"), normalize_key("http://b.example/")},
+        )
+        self.assertIn(repr(BAD_PORT_URL), "\n".join(logs.output))
+
+    @patch("requests.Session")
+    def test_pagination_completes_past_unparsable_rows(self, mock_session_cls):
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _json_response(2)
+            if params["page"] == 0:
+                return _json_response([["original"], ["http://a.example/"]])
+            return _json_response(
+                [
+                    ["original"],
+                    [BAD_PORT_URL],
+                    [LONE_SURROGATE_URL],
+                    ["http://b.example/"],
+                ]
+            )
+
+        mock_session_cls.return_value.get.side_effect = _route
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = os.path.join(tmp, "cache.db")
+            with (
+                _join_new_threads(),
+                self.assertLogs("waygap", level="WARNING") as logs,
+            ):
+                ensure_archived_db(TARGET, cache_path, workers=1)
+            conn = sqlite3.connect(cache_path)
+            try:
+                done = {r[0] for r in conn.execute("SELECT page FROM pages_done;")}
+                keys = {r[0] for r in conn.execute("SELECT key FROM archived;")}
+                completed = read_meta(conn).get("completed")
+            finally:
+                conn.close()
+        self.assertEqual(done, {0, 1})
+        self.assertEqual(
+            keys,
+            {normalize_key("http://a.example/"), normalize_key("http://b.example/")},
+        )
+        self.assertEqual(completed, "1")
+        self.assertIn(repr(BAD_PORT_URL), "\n".join(logs.output))
+
+    @patch("requests.Session")
+    def test_resumekey_fetch_completes_past_unparsable_rows(self, mock_session_cls):
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _no_pagination_response()
+            if params.get("resumeKey") is None:
+                return _json_response(
+                    [["original"], ["http://a.example/"], [BAD_PORT_URL], [], ["KEY1"]]
+                )
+            return _json_response(
+                [["original"], [LONE_SURROGATE_URL], ["http://b.example/"]]
+            )
+
+        mock_session_cls.return_value.get.side_effect = _route
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = os.path.join(tmp, "cache.db")
+            with self.assertLogs("waygap", level="WARNING") as logs:
+                ensure_archived_db(TARGET, cache_path, workers=1)
+            conn = sqlite3.connect(cache_path)
+            try:
+                keys = {r[0] for r in conn.execute("SELECT key FROM archived;")}
+                completed = read_meta(conn).get("completed")
+            finally:
+                conn.close()
+        self.assertEqual(
+            keys,
+            {normalize_key("http://a.example/"), normalize_key("http://b.example/")},
+        )
+        self.assertEqual(completed, "1")
+        self.assertIn(repr(BAD_PORT_URL), "\n".join(logs.output))
+
+    def _write_input(self, directory: str) -> str:
+        input_file = Path(directory) / "urls.txt"
+        input_file.write_text(
+            f"http://a.example/\n{BAD_PORT_URL}\nhttp://b.example/\n", encoding="utf-8"
+        )
+        return str(input_file)
+
+    def _make_db(self, directory: str) -> str:
+        db_path = os.path.join(directory, "cache.db")
+        conn = open_db(db_path)
+        try:
+            insert_urls(conn, [normalize_key("http://a.example/")])
+        finally:
+            conn.close()
+        return db_path
+
+    def test_scan_reports_unparsable_line_as_unarchived(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_file = self._write_input(directory)
+            db_path = self._make_db(directory)
+            out_file = Path(directory) / "not_archived.txt"
+            arch_file = Path(directory) / "archived.txt"
+            with self.assertLogs("waygap", level="WARNING") as logs:
+                result = scan_input_against_db(
+                    input_file,
+                    db_path,
+                    output_file=str(out_file),
+                    output_archived=str(arch_file),
+                )
+            not_archived = out_file.read_text(encoding="utf-8").splitlines()
+            archived = arch_file.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(result, (3, 2, 1))
+        self.assertEqual(not_archived, [BAD_PORT_URL, "http://b.example/"])
+        self.assertEqual(archived, ["http://a.example/"])
+        text = "\n".join(logs.output)
+        self.assertIn("line 2", text)
+        self.assertIn(repr(BAD_PORT_URL), text)
+
+    def test_detect_reports_unparsable_line_as_unarchived(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_file = self._write_input(directory)
+            with self.assertLogs("waygap", level="WARNING") as logs:
+                not_archived, archived, total = detect_not_archived(
+                    input_file,
+                    {normalize_key("http://a.example/")},
+                    collect_archived=True,
+                )
+        self.assertEqual(not_archived, [BAD_PORT_URL, "http://b.example/"])
+        self.assertEqual(archived, ["http://a.example/"])
+        self.assertEqual(total, 3)
+        self.assertIn("line 2", "\n".join(logs.output))
+
+    def test_main_finishes_with_unparsable_input_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_file = self._write_input(directory)
+            db_path = self._make_db(directory)
+            out_file = Path(directory) / "not_archived.txt"
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "waygap.py",
+                        TARGET,
+                        "--input",
+                        input_file,
+                        "--output",
+                        str(out_file),
+                    ],
+                ),
+                patch("waygap.ensure_archived_db", return_value=db_path),
+                self.assertLogs("waygap", level="INFO"),
+            ):
+                self.assertEqual(main(), 0)
+            not_archived = out_file.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(not_archived, [BAD_PORT_URL, "http://b.example/"])
+
+
 class TestVersion(unittest.TestCase):
     """Tests for the version string and User-Agent."""
 

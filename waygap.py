@@ -304,6 +304,29 @@ def normalize_key(url: str, key_opts: dict[str, Any] | None = None) -> str:
     return _surt_key(text, **opts)
 
 
+def _try_normalize_key(
+    url: str, key_opts: dict[str, Any] | None, context: str
+) -> str | None:
+    """normalize_key(), or None with a warning when surt cannot parse the URL.
+
+    surt raises ValueError for an invalid port and UnicodeEncodeError (a
+    ValueError subclass) for a lone surrogate. `context` says where the URL
+    came from and what the caller does with it.
+    """
+    try:
+        return normalize_key(url, key_opts)
+    except ValueError as e:
+        logger.warning(f"Cannot parse URL {context}: {url!r} ({e})")
+        return None
+
+
+_CDX_ROW_CONTEXT = "in a CDX row, skipping it"
+
+
+def _input_context(line_no: int) -> str:
+    return f"at input line {line_no}, reporting it as unarchived"
+
+
 # ========================================
 # SQLite cache layer
 # ========================================
@@ -800,7 +823,9 @@ def _rows_to_keys(rows: Iterable[list], key_opts: dict[str, Any] | None) -> list
             continue
         original = row[0]
         if isinstance(original, str) and original and original.strip():
-            out.append(normalize_key(original, key_opts))
+            key = _try_normalize_key(original, key_opts, _CDX_ROW_CONTEXT)
+            if key is not None:
+                out.append(key)
     return out
 
 
@@ -918,7 +943,9 @@ def _store_resumekey_rows(
                     if not isinstance(row, list) or not row:
                         continue
                     if isinstance(row[0], str) and row[0] and row[0].strip():
-                        batch.append(normalize_key(row[0], key_opts))
+                        key = _try_normalize_key(row[0], key_opts, _CDX_ROW_CONTEXT)
+                        if key is not None:
+                            batch.append(key)
                     if len(batch) >= INSERT_CHUNK_SIZE:
                         insert_urls(conn, batch)
                         inserted += len(batch)
@@ -1182,7 +1209,9 @@ def extract_archived_urls(
 
         # Ensure the URL value is a string
         if isinstance(original_url, str) and original_url and original_url.strip():
-            archived_keys.add(normalize_key(original_url, key_opts))
+            key = _try_normalize_key(original_url, key_opts, _CDX_ROW_CONTEXT)
+            if key is not None:
+                archived_keys.add(key)
 
     return archived_keys
 
@@ -1220,7 +1249,7 @@ def detect_not_archived(
     total_count = 0
 
     with open(input_file, encoding="utf-8-sig") as f:
-        for line in f:
+        for line_no, line in enumerate(f, start=1):
             original_url = line.strip()
 
             if not original_url:
@@ -1228,9 +1257,9 @@ def detect_not_archived(
 
             total_count += 1
 
-            key = normalize_key(original_url, key_opts)
+            key = _try_normalize_key(original_url, key_opts, _input_context(line_no))
 
-            if key not in archived_keys:
+            if key is None or key not in archived_keys:
                 not_archived.append(original_url)
             elif archived is not None:
                 archived.append(original_url)
@@ -1291,16 +1320,18 @@ def scan_input_against_db(
             total_count = 0
             not_count = 0
             arch_count = 0
-            batch: list[tuple[str, str]] = []  # (original line, surt key)
+            # (original line, surt key); the key is None for an unparsable URL,
+            # which is reported as unarchived.
+            batch: list[tuple[str, str | None]] = []
 
             def _flush() -> None:
                 nonlocal not_count, arch_count
                 if not batch:
                     return
-                key_list = [k for _, k in batch]
+                key_list = [k for _, k in batch if k is not None]
                 found = batch_lookup_found(conn, key_list)
                 for original, key in batch:
-                    if key in found:
+                    if key is not None and key in found:
                         arch_count += 1
                         if arch_f is not None:
                             arch_f.write(original + "\n")
@@ -1312,12 +1343,14 @@ def scan_input_against_db(
 
             with open(input_file, encoding="utf-8-sig") as f:
                 with tqdm(total=total_lines, desc="Checking URLs", unit="url") as bar:
-                    for line in f:
+                    for line_no, line in enumerate(f, start=1):
                         original_url = line.strip()
                         if not original_url:
                             continue
                         total_count += 1
-                        key = normalize_key(original_url, key_opts)
+                        key = _try_normalize_key(
+                            original_url, key_opts, _input_context(line_no)
+                        )
                         batch.append((original_url, key))
                         if len(batch) >= batch_size:
                             _flush()

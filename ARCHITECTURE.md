@@ -32,14 +32,14 @@ flowchart TD
         RESUME --> NUM
         NUM -- "page count available" --> PAR["fetch_page_rows × workers\n_fetch_pages_parallel"]
         NUM -- "unsupported" --> SEQ["fetch_resumekey_rows\nsequential"]
-        PAR --> NORM["_rows_to_keys\nnormalize_key (surt)"]
+        PAR --> NORM["_rows_to_keys\n_try_normalize_key (surt)"]
         NORM --> INS["insert_urls"]
         INS --> DONE_PAGES["mark_page_done\nset_completed"]
-        SEQ --> STORE["_store_resumekey_rows\nnormalize_key + insert_urls"]
+        SEQ --> STORE["_store_resumekey_rows\n_try_normalize_key + insert_urls"]
         STORE -- "generator ended normally" --> SEQ_DONE["set_completed"]
     end
 
-    REUSE --> SCAN["scan_input_against_db\n(keyed by normalize_key)"]
+    REUSE --> SCAN["scan_input_against_db\n(keyed by _try_normalize_key)"]
     DONE_PAGES --> SCAN
     SEQ_DONE --> SCAN
 
@@ -67,6 +67,7 @@ flowchart TD
 | `build_key_opts` | surt options for a run |
 | `key_profile` | Stable fingerprint for cache identity (e.g. `surt-default` / `surt:host_massage=False`) |
 | `normalize_key` | Converts a URL to a surt key |
+| `_try_normalize_key` | Wraps `normalize_key` for every caller; returns `None` for a URL that surt cannot parse, so the CDX row is skipped and the input line is reported as unarchived |
 | `canonicalize_nodns` | Copy of surt.GoogleURLCanonicalizer.canonicalize. Only `attemptIPFormats()` is replaced with a DNS-free variant (removing `socket.gethostbyname_ex` for numerically shaped hosts). Byte-identical to the default canonicalizer for ordinary hosts |
 
 ### CDX API layer
