@@ -27,6 +27,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
+from requests.adapters import HTTPAdapter
 from surt import surt as upstream_surt
 
 import waygap
@@ -78,6 +79,19 @@ def _json_response(payload):
     m.status_code = 200
     m.json.return_value = payload
     m.raise_for_status.return_value = None
+    return m
+
+
+def _status_response(status, headers=None):
+    """Build a mocked requests.Response with an empty body and `status`."""
+    m = MagicMock()
+    m.status_code = status
+    m.headers = dict(headers or {})
+    m.content = b""
+    m.text = ""
+    m.raise_for_status.side_effect = requests.exceptions.HTTPError(
+        f"{status} Client Error", response=m
+    )
     return m
 
 
@@ -817,6 +831,40 @@ class TestCdxRateLimiter(unittest.TestCase):
         mock_sleep.assert_not_called()
 
     @patch("waygap.time.sleep")
+    @patch("waygap.time.monotonic", return_value=100.0)
+    def test_wait_after_pause_waits_for_the_pause(self, _monotonic, mock_sleep):
+        limiter = _RateLimiter(3.0)
+        limiter.pause(60.0)
+        limiter.wait()
+        mock_sleep.assert_called_once_with(60.0)
+
+        mock_sleep.reset_mock()
+        limiter = _RateLimiter(3.0)
+        limiter.pause(120.0)
+        limiter.pause(60.0)  # must not shorten the longer pause
+        limiter.wait()
+        mock_sleep.assert_called_once_with(120.0)
+
+    @patch("waygap.time.sleep")
+    @patch("waygap.time.monotonic")
+    def test_pause_during_wait_makes_wait_retake_a_slot(
+        self, mock_monotonic, mock_sleep
+    ):
+        limiter = _RateLimiter(3.0)
+        mock_monotonic.return_value = 100.0
+        limiter.wait()  # the next slot is at 103
+
+        def _sleep(seconds):
+            if mock_sleep.call_count == 1:
+                limiter.pause(60.0)  # another worker got a 429 at 100
+            mock_monotonic.return_value += seconds
+
+        mock_sleep.side_effect = _sleep
+        limiter.wait()
+
+        self.assertEqual([c.args[0] for c in mock_sleep.call_args_list], [3.0, 57.0])
+
+    @patch("waygap.time.sleep")
     @patch("requests.Session")
     def test_get_with_retries_waits_before_each_attempt(self, mock_session_cls, _sleep):
         mock_session = mock_session_cls.return_value
@@ -921,6 +969,208 @@ class TestFetchCancellation(unittest.TestCase):
             )
 
         mock_session.get.assert_not_called()
+
+
+class TestCdxRateLimit429(unittest.TestCase):
+    """Tests for pausing every CDX request after HTTP 429."""
+
+    URL = "https://example.invalid/"
+
+    @staticmethod
+    def _pauses(mock_limiter) -> list:
+        return [c.args[0] for c in mock_limiter.pause.call_args_list]
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_one_429_pauses_60_s_then_retries(self, mock_session_cls, mock_sleep):
+        ok = _json_response([["original"]])
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [_status_response(429), ok]
+
+        with patch("waygap._CDX_LIMITER") as mock_limiter:
+            response = _get_with_retries(mock_session, self.URL, {}, {})
+
+        self.assertIs(response, ok)
+        self.assertEqual(self._pauses(mock_limiter), [60.0])
+        self.assertEqual(mock_session.get.call_count, 2)
+        mock_sleep.assert_not_called()
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_consecutive_429s_pause_60_120_240_s(self, mock_session_cls, mock_sleep):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [_status_response(429)] * 3 + [
+            _json_response([["original"]])
+        ]
+
+        with patch("waygap._CDX_LIMITER") as mock_limiter:
+            _get_with_retries(mock_session, self.URL, {}, {})
+
+        self.assertEqual(self._pauses(mock_limiter), [60.0, 120.0, 240.0])
+        self.assertEqual(mock_session.get.call_count, 4)
+        mock_sleep.assert_not_called()
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_fourth_429_fails_without_more_requests(self, mock_session_cls, mock_sleep):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [_status_response(429)] * 4 + [
+            _json_response([["original"]])
+        ]
+
+        with (
+            patch("waygap._CDX_LIMITER"),
+            self.assertRaises(CDXAPIError) as cm,
+        ):
+            _get_with_retries(mock_session, self.URL, {}, {})
+
+        self.assertIn("429", str(cm.exception))
+        self.assertEqual(mock_session.get.call_count, 4)
+        mock_sleep.assert_not_called()
+
+    @patch("requests.Session")
+    def test_stop_during_pause_cancels_at_once(self, mock_session_cls):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [
+            _status_response(429),
+            _json_response([["original"]]),
+        ]
+        stop = threading.Event()
+        timer = threading.Timer(0.2, stop.set)
+
+        with patch("waygap._CDX_LIMITER", _RateLimiter(0)):
+            start = time.monotonic()
+            timer.start()
+            try:
+                with self.assertRaises(waygap._FetchCancelled):
+                    _get_with_retries(mock_session, self.URL, {}, {}, stop=stop)
+            finally:
+                timer.cancel()
+
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertEqual(mock_session.get.call_count, 1)
+
+    def test_session_leaves_429_to_cdx_get_and_retries_5xx(self):
+        adapter = waygap.make_session().get_adapter("https://web.archive.org/")
+        assert isinstance(adapter, HTTPAdapter)
+        retry = adapter.max_retries
+
+        self.assertFalse(retry.is_retry("GET", 429))
+        self.assertFalse(retry.is_retry("GET", 429, has_retry_after=True))
+        self.assertTrue(retry.is_retry("GET", 503))
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_retry_after_raises_the_first_pause(self, mock_session_cls, mock_sleep):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [
+            _status_response(429, {"Retry-After": "200"}),
+            _json_response([["original"]]),
+        ]
+
+        with (
+            patch("waygap._CDX_LIMITER") as mock_limiter,
+            self.assertLogs("waygap", level="WARNING") as logs,
+        ):
+            _get_with_retries(mock_session, self.URL, {}, {})
+
+        self.assertEqual(self._pauses(mock_limiter), [200.0])
+        self.assertTrue(any("200" in line for line in logs.output))
+        mock_sleep.assert_not_called()
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_retry_after_over_last_pause_fails_at_once(
+        self, mock_session_cls, mock_sleep
+    ):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [
+            _status_response(429, {"Retry-After": "241"}),
+            _json_response([["original"]]),
+        ]
+
+        with (
+            patch("waygap._CDX_LIMITER") as mock_limiter,
+            self.assertRaises(CDXAPIError) as cm,
+        ):
+            _get_with_retries(mock_session, self.URL, {}, {})
+
+        self.assertIn("241", str(cm.exception))
+        mock_limiter.pause.assert_not_called()
+        self.assertEqual(mock_session.get.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_retry_after_equal_to_last_pause_is_waited(
+        self, mock_session_cls, mock_sleep
+    ):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [
+            _status_response(429, {"Retry-After": "240"}),
+            _json_response([["original"]]),
+        ]
+
+        with patch("waygap._CDX_LIMITER") as mock_limiter:
+            _get_with_retries(mock_session, self.URL, {}, {})
+
+        self.assertEqual(self._pauses(mock_limiter), [240.0])
+        mock_sleep.assert_not_called()
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_short_retry_after_does_not_shorten_the_pause(
+        self, mock_session_cls, mock_sleep
+    ):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [
+            _status_response(429, {"Retry-After": "10"}),
+            _json_response([["original"]]),
+        ]
+
+        with patch("waygap._CDX_LIMITER") as mock_limiter:
+            _get_with_retries(mock_session, self.URL, {}, {})
+
+        self.assertEqual(self._pauses(mock_limiter), [60.0])
+        mock_sleep.assert_not_called()
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_invalid_retry_after_is_ignored(self, mock_session_cls, mock_sleep):
+        for value in ("soon", "-5"):
+            with self.subTest(retry_after=value):
+                mock_session = mock_session_cls.return_value
+                mock_session.get.reset_mock()
+                mock_session.get.side_effect = [
+                    _status_response(429, {"Retry-After": value}),
+                    _json_response([["original"]]),
+                ]
+
+                with patch("waygap._CDX_LIMITER") as mock_limiter:
+                    _get_with_retries(mock_session, self.URL, {}, {})
+
+                self.assertEqual(self._pauses(mock_limiter), [60.0])
+        mock_sleep.assert_not_called()
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_resumekey_fetch_keeps_key_after_persistent_429(
+        self, mock_session_cls, mock_sleep
+    ):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [
+            _json_response([["original"], ["http://a.example/"], [], ["KEY1"]])
+        ] + [_status_response(429)] * 4
+
+        with (
+            patch("waygap._CDX_LIMITER"),
+            self.assertRaises(waygap.ResumeKeyRequestError) as cm,
+        ):
+            _drain(fetch_resumekey_rows(TARGET, None, None, None, mock_session, {}))
+
+        self.assertEqual(cm.exception.resume_key, "KEY1")
+        self.assertIn("429", str(cm.exception))
+        mock_sleep.assert_not_called()
 
 
 class TestFetchPageRowsChaining(unittest.TestCase):

@@ -42,6 +42,7 @@ from surt.GoogleURLCanonicalizer import (
 from surt.IAURLCanonicalizer import canonicalize as ia_canonicalize
 from surt.surt import CompositeCanonicalizer
 from tqdm import tqdm
+from urllib3.exceptions import InvalidHeader
 from urllib3.util import Retry
 
 # Logger setup
@@ -89,6 +90,9 @@ CDX_FL = "original"
 # the `wayback` library (v0.5.1, 2026-06) defaults to 80% of it, 24 per
 # minute. 3 s (20 per minute, ~67% of the limit) leaves headroom for retries.
 CDX_REQUEST_INTERVAL = 3.0
+# Seconds to pause every CDX request after consecutive HTTP 429s. An IP that
+# keeps sending after a 429 gets blocked, so the pauses are long.
+CDX_429_PAUSES = (60.0, 120.0, 240.0)
 # Page fetch workers. The request rate is set by CDX_REQUEST_INTERVAL, so
 # workers only hide response latency; 2 keep the interval filled.
 DEFAULT_WORKERS = 2
@@ -493,23 +497,36 @@ class _RateLimiter:
     """Spaces calls to wait() at least `interval` seconds apart across threads.
 
     Each caller reserves the next free slot under the lock and sleeps
-    outside it, so a waiting thread does not block the others.
+    outside it, so a waiting thread does not block the others. pause() holds
+    every caller, including those already waiting, until the pause ends.
     """
 
     def __init__(self, interval: float) -> None:
         self._interval = interval
         self._lock = threading.Lock()
         self._next = 0.0
+        self._paused_until = 0.0
+
+    def pause(self, seconds: float) -> None:
+        """Hold every wait() until `seconds` from now (never shortens a pause)."""
+        with self._lock:
+            self._paused_until = max(self._paused_until, time.monotonic() + seconds)
+            self._next = max(self._next, self._paused_until)
 
     def wait(self, stop: threading.Event | None = None) -> None:
         """Wait for the next slot; raises _FetchCancelled if `stop` is set."""
-        with self._lock:
-            now = time.monotonic()
-            start = max(now, self._next)
-            self._next = start + self._interval
-        delay = start - now
-        if delay > 0:
-            _pause(delay, stop)
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                start = max(now, self._next)
+                self._next = start + self._interval
+            delay = start - now
+            if delay > 0:
+                _pause(delay, stop)
+            with self._lock:
+                if self._paused_until <= start:
+                    return
+            # A pause began while waiting for the slot: take a slot after it.
 
 
 _CDX_LIMITER = _RateLimiter(CDX_REQUEST_INTERVAL)
@@ -520,9 +537,11 @@ def make_session() -> requests.Session:
     retry = Retry(
         total=3,
         backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
+        # HTTP 429 is left to _cdx_get(), which pauses every CDX request.
+        status_forcelist=[500, 502, 503, 504],
         allowed_methods=["GET"],
         raise_on_status=False,
+        respect_retry_after_header=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
@@ -560,6 +579,65 @@ def _strip_header(data: list) -> list:
     return data
 
 
+def _cdx_get(
+    session: requests.Session,
+    api_url: str,
+    params: dict,
+    headers: dict,
+    timeout: int,
+    stop: threading.Event | None,
+) -> requests.Response:
+    """GET once through the shared limiter and return the first non-429 response.
+
+    After an HTTP 429, pauses every CDX request (in all threads) through the
+    limiter and sends again. Raises CDXAPIError when 429s continue after the
+    last pause in CDX_429_PAUSES, or when Retry-After asks for longer than
+    that pause. Raises _FetchCancelled once `stop` is set.
+    """
+    rate_limited = 0
+    while True:
+        _CDX_LIMITER.wait(stop)
+        if stop is not None and stop.is_set():
+            raise _FetchCancelled
+        response = session.get(api_url, params=params, headers=headers, timeout=timeout)
+        if stop is not None and stop.is_set():
+            raise _FetchCancelled
+        if response.status_code != 429:
+            return response
+
+        rate_limited += 1
+        raw = response.headers.get("Retry-After")
+        retry_after: float | None = None
+        if raw is None:
+            shown = "none"
+        else:
+            try:
+                retry_after = Retry().parse_retry_after(raw)
+                shown = raw
+            except InvalidHeader:
+                shown = f"{raw!r}, ignored as invalid"
+        if rate_limited > len(CDX_429_PAUSES):
+            pauses = ", ".join(f"{p:g}" for p in CDX_429_PAUSES)
+            raise CDXAPIError(
+                f"CDX API kept returning HTTP 429 after pausing {pauses} s "
+                f"(Retry-After: {shown}). Wait several minutes before re-running; "
+                "re-running at once counts against the rate limit again."
+            )
+        longest = CDX_429_PAUSES[-1]
+        if retry_after is not None and retry_after > longest:
+            raise CDXAPIError(
+                f"CDX API returned HTTP 429 with Retry-After: {raw} "
+                f"({retry_after:g} s), longer than the {longest:g} s this tool "
+                "waits. Re-run after that time."
+            )
+        delay = max(CDX_429_PAUSES[rate_limited - 1], retry_after or 0.0)
+        logger.warning(
+            f"CDX API rate limit (HTTP 429, {rate_limited}/{len(CDX_429_PAUSES)}); "
+            f"pausing all CDX requests for {delay:g} s (Retry-After: {shown})"
+        )
+        _CDX_LIMITER.pause(delay)
+
+
 def _get_with_retries(
     session: requests.Session,
     api_url: str,
@@ -570,20 +648,14 @@ def _get_with_retries(
 ) -> requests.Response:
     """GET with retries for transport errors and non-JSON/empty 200 responses.
 
-    Once `stop` is set, raises _FetchCancelled instead of sending, retrying
-    or logging. A request already in progress is not interrupted.
+    HTTP 429 is handled by _cdx_get(). Once `stop` is set, raises
+    _FetchCancelled instead of sending, retrying or logging. A request
+    already in progress is not interrupted.
     """
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            _CDX_LIMITER.wait(stop)
-            if stop is not None and stop.is_set():
-                raise _FetchCancelled
-            response = session.get(
-                api_url, params=params, headers=headers, timeout=timeout
-            )
-            if stop is not None and stop.is_set():
-                raise _FetchCancelled
+            response = _cdx_get(session, api_url, params, headers, timeout, stop)
             response.raise_for_status()
             content_type = response.headers.get("Content-Type", "")
             body = response.content

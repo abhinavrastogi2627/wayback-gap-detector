@@ -103,6 +103,12 @@ recorded in the cache database, so re-running the same command fetches only
 the missing pages. No manual cleanup is needed; use `--refresh` only when you
 want to rebuild the cache from scratch.
 
+If the CDX API answers HTTP 429 (Too Many Requests), the tool pauses all
+requests before trying again, waiting about 7 minutes while the limit
+persists, or up to about 12 minutes if the server asks for longer waits. If
+it still persists, the run stops with an error; wait several minutes, then
+re-run as described in this section.
+
 `--resume-key` is only needed for the `resumeKey` fallback path (used when the
 server does not support pagination). If a fallback run fails mid-way, the tool
 logs the `resumeKey` value — add it to your original command (without
