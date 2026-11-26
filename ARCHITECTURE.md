@@ -79,7 +79,7 @@ flowchart TD
 | `_RateLimiter.pause` | Holds every caller's `wait()` for the given number of seconds |
 | `make_session` | Creates a `Session` that retries only connection and read errors (HTTP 429 is left to `_cdx_get`, 5xx to `_get_with_retries` and `get_num_pages`) |
 | `_cdx_get` | Sends one GET through the shared limiter; on HTTP 429, pauses every CDX request before sending again |
-| `_wait_after_5xx` | Waits before resending after a 5xx; a Retry-After pauses every CDX request, and one longer than the last 429 pause stops the run. Shared by `_get_with_retries` and `get_num_pages` |
+| `_wait_after_5xx` | Waits before resending after a 5xx; a Retry-After pauses every CDX request. Shared by `_get_with_retries` and `get_num_pages` |
 | `_cdx_params` | Builds request parameters shared by both fetch paths |
 | `_split_resume_key` | Splits a trailing resumeKey off the raw response |
 | `_strip_header` | Removes the header row (`urlkey`/`original`) at the start of a chunk |
