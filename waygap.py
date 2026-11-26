@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Generator, Iterable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -423,6 +424,13 @@ def set_completed(conn: sqlite3.Connection, done: bool = True) -> None:
             "INSERT OR REPLACE INTO meta(k, v) VALUES ('completed', ?);",
             ("1" if done else "0",),
         )
+        if done:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(k, v) VALUES ('built_at', ?);",
+                (datetime.now(UTC).isoformat(),),
+            )
+        else:
+            conn.execute("DELETE FROM meta WHERE k='built_at';")
 
 
 def get_done_pages(conn: sqlite3.Connection) -> set[int]:
@@ -1125,7 +1133,9 @@ def ensure_archived_db(
             else:
                 logger.info(
                     f"Reusing completed cache: {cache_file} "
-                    f"({count_archived(conn)} URLs)"
+                    f"({count_archived(conn)} URLs; built at: "
+                    f"{meta.get('built_at') or 'unknown'}). "
+                    "Use --refresh to fetch newer archives."
                 )
                 return cache_file
 

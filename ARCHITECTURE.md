@@ -54,7 +54,7 @@ flowchart TD
 
 | Table | Definition | Purpose |
 |---|---|---|
-| `meta` | `(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID` | Run parameters, `key_profile`, `completed` flag, `mode`, `resume_key`, etc. Rebuilt automatically when parameters differ. `completed` is set to 1 only after the whole fetch finishes, so an interrupted fetch is never reused as complete |
+| `meta` | `(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID` | Run parameters, `key_profile`, `completed` flag, `built_at` (UTC completion time), `mode`, `resume_key`, etc. Rebuilt automatically when parameters differ. `completed` is set to 1 only after the whole fetch finishes, so an interrupted fetch is never reused as complete. `built_at` is written atomically with completion, cleared when marked incomplete, and is not part of cache identity. Legacy caches without it remain reusable with an unknown build time |
 | `archived` | `(key TEXT PRIMARY KEY) WITHOUT ROWID` | Set of surt keys only (`original` is not stored) |
 | `pages_done` | `(page INTEGER PRIMARY KEY)` | Fetched page numbers. On interruption, only missing pages are fetched again |
 
