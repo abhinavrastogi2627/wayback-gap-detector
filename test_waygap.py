@@ -3110,6 +3110,25 @@ def test_cache_reuse_reports_build_time_and_refresh_hint(
         assert read_meta(conn) == meta
 
 
+def test_cache_reuse_with_null_build_time(tmp_path, caplog):
+    cache = str(tmp_path / "cache.db")
+    conn = open_db(cache)
+    write_meta(conn, {**expected_meta(TARGET, {}, None), "completed": "1"})
+    with conn:
+        conn.execute("INSERT INTO meta(k, v) VALUES ('built_at', NULL)")
+    conn.close()
+    with patch("requests.Session") as session, caplog.at_level("INFO", logger="waygap"):
+        session.return_value.get.side_effect = _no_network
+        assert ensure_archived_db(TARGET, cache) == cache
+    reuse = next(
+        r.message for r in caplog.records if "Reusing completed cache" in r.message
+    )
+    assert "built at: unknown" in reuse
+    assert "--refresh" in reuse
+    with sqlite3.connect(cache) as conn:
+        assert read_meta(conn)["built_at"] is None
+
+
 def test_cache_completion_timestamp_failure_rolls_back_completion(tmp_path):
     conn = open_db(str(tmp_path / "cache.db"))
     try:

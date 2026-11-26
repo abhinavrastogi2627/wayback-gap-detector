@@ -1136,7 +1136,7 @@ def ensure_archived_db(
                     built_at = datetime.fromisoformat(meta.get("built_at", ""))
                     if built_at.utcoffset() is None:
                         built_at = None
-                except ValueError:
+                except (TypeError, ValueError):
                     built_at = None
                 build_time = (
                     built_at.astimezone(UTC).isoformat()
