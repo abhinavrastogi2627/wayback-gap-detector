@@ -97,8 +97,10 @@ python waygap.py "https://example.com/blog/*" \
 You can also add `--output-archived archived.txt` to write the archived URLs to a separate file.
 
 Completed caches are reused until you pass `--refresh`. The reuse log shows the
-UTC build time (or `unknown` for older caches) and a refresh hint. Use `--refresh`
-to include URLs archived since the cache was built.
+UTC build time (or `unknown` if it is missing, invalid, or lacks a time zone).
+It suggests `--refresh` when the cache is at least seven days old or its build
+time is unknown. This is advisory only; caches do not expire automatically.
+Use `--refresh` to include URLs archived since the cache was built.
 
 ### Resume an interrupted fetch
 

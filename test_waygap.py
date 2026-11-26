@@ -3067,8 +3067,25 @@ def test_cache_completion_records_utc_build_time(tmp_path, mode):
     assert before <= built_at <= after
 
 
-@pytest.mark.parametrize("built_at", [None, "2020-01-02T03:04:05+00:00"])
-def test_cache_reuse_reports_build_time_and_refresh_hint(tmp_path, caplog, built_at):
+@pytest.mark.parametrize(
+    ("built_at", "display_time", "refresh_hint"),
+    [
+        (None, "unknown", True),
+        ("", "unknown", True),
+        ("not-a-date", "unknown", True),
+        ("2026-11-19", "unknown", True),
+        ("2026-11-19T12:00:00", "unknown", True),
+        ("2026-11-19T12:00:00+00:00", "2026-11-19T12:00:00+00:00", True),
+        ("2026-11-19T11:59:59.999999+00:00", "2026-11-19T11:59:59.999999+00:00", True),
+        ("2026-11-19T12:00:00.000001+00:00", "2026-11-19T12:00:00.000001+00:00", False),
+        ("2026-11-26T11:00:00+00:00", "2026-11-26T11:00:00+00:00", False),
+        ("2026-11-27T12:00:00+00:00", "2026-11-27T12:00:00+00:00", False),
+        ("2026-11-19T17:30:00+05:30", "2026-11-19T12:00:00+00:00", True),
+    ],
+)
+def test_cache_reuse_reports_build_time_and_refresh_hint(
+    tmp_path, caplog, built_at, display_time, refresh_hint
+):
     cache = str(tmp_path / "cache.db")
     conn = open_db(cache)
     meta = {**expected_meta(TARGET, {}, None), "completed": "1", "mode": "pagination"}
@@ -3076,14 +3093,19 @@ def test_cache_reuse_reports_build_time_and_refresh_hint(tmp_path, caplog, built
         meta["built_at"] = built_at
     write_meta(conn, meta)
     conn.close()
-    with patch("requests.Session") as session, caplog.at_level("INFO", logger="waygap"):
+    with (
+        patch("requests.Session") as session,
+        patch("waygap.datetime", wraps=datetime) as clock,
+        caplog.at_level("INFO", logger="waygap"),
+    ):
+        clock.now.return_value = datetime(2026, 11, 26, 12, tzinfo=UTC)
         session.return_value.get.side_effect = _no_network
         assert ensure_archived_db(TARGET, cache) == cache
     reuse = next(
         r.message for r in caplog.records if "Reusing completed cache" in r.message
     )
-    assert (built_at or "unknown") in reuse
-    assert "--refresh" in reuse
+    assert f"built at: {display_time}" in reuse
+    assert ("--refresh" in reuse) == refresh_hint
     with sqlite3.connect(cache) as conn:
         assert read_meta(conn) == meta
 
