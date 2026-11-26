@@ -107,7 +107,10 @@ If the CDX API answers HTTP 429 (Too Many Requests), the tool pauses all
 requests before trying again, waiting about 7 minutes while the limit
 persists, or up to about 12 minutes if the server asks for longer waits. If
 it still persists, the run stops with an error; wait several minutes, then
-re-run as described in this section.
+re-run as described in this section. If a 5xx response carries Retry-After,
+the tool pauses all requests for that time in the same way; if the server
+asks for more than 4 minutes, the run stops with an error, so re-run after
+that time.
 
 `--resume-key` is only needed for the `resumeKey` fallback path (used when the
 server does not support pagination). If a fallback run fails mid-way, the tool
