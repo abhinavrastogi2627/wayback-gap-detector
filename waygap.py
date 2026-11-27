@@ -711,6 +711,9 @@ def get_num_pages(
     is only valid against the same query shape that will fetch the pages
     (the CDX contract pairs the two; a mismatched pageSize would silently
     truncate the fetch at the tail).
+
+    HTTP 429 is not taken as "unsupported": _cdx_get() pauses and retries,
+    and raises CDXAPIError if the 429s continue.
     """
     api_url = "https://web.archive.org/cdx/search/cdx"
     params: dict[str, Any] = {
@@ -723,8 +726,7 @@ def get_num_pages(
     if collapse:
         params["collapse"] = collapse
     try:
-        _CDX_LIMITER.wait()
-        response = session.get(api_url, params=params, headers=headers, timeout=60)
+        response = _cdx_get(session, api_url, params, headers, 60, None)
         response.raise_for_status()
         text = response.text.strip()
         # Server returns a bare number (plain text or JSON int).

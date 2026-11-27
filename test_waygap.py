@@ -886,7 +886,7 @@ class TestCdxRateLimiter(unittest.TestCase):
         with patch("waygap._CDX_LIMITER") as mock_limiter:
             get_num_pages("http://example.com/*", None, CDX_COLLAPSE, mock_session, {})
 
-        mock_limiter.wait.assert_called_once_with()
+        mock_limiter.wait.assert_called_once_with(None)
 
 
 class TestFetchCancellation(unittest.TestCase):
@@ -1171,6 +1171,40 @@ class TestCdxRateLimit429(unittest.TestCase):
 
         self.assertEqual(cm.exception.resume_key, "KEY1")
         self.assertIn("429", str(cm.exception))
+        mock_sleep.assert_not_called()
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_get_num_pages_429_pauses_then_returns_count(
+        self, mock_session_cls, mock_sleep
+    ):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [_status_response(429), _json_response(5)]
+
+        with patch("waygap._CDX_LIMITER") as mock_limiter:
+            n = get_num_pages(TARGET, None, CDX_COLLAPSE, mock_session, {})
+
+        self.assertEqual(n, 5)
+        self.assertEqual(self._pauses(mock_limiter), [60.0])
+        self.assertEqual(mock_session.get.call_count, 2)
+        mock_sleep.assert_not_called()
+
+    @patch("waygap.time.sleep")
+    @patch("requests.Session")
+    def test_get_num_pages_persistent_429_fails_without_more_requests(
+        self, mock_session_cls, mock_sleep
+    ):
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = [_status_response(429)] * 4 + [_json_response(5)]
+
+        with (
+            patch("waygap._CDX_LIMITER"),
+            self.assertRaises(CDXAPIError) as cm,
+        ):
+            get_num_pages(TARGET, None, CDX_COLLAPSE, mock_session, {})
+
+        self.assertIn("429", str(cm.exception))
+        self.assertEqual(mock_session.get.call_count, 4)
         mock_sleep.assert_not_called()
 
 
@@ -2381,6 +2415,62 @@ class TestCDXPaginationDB(unittest.TestCase):
         finally:
             if os.path.exists(cache_path):
                 os.unlink(cache_path)
+
+    @patch("requests.Session")
+    def test_num_pages_429_keeps_pagination(self, mock_session_cls):
+        num_pages_responses = [_status_response(429), _json_response(1)]
+
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return num_pages_responses.pop(0)
+            if params.get("page") == 0:
+                return _json_response([["original"], ["http://a.example/"]])
+            raise AssertionError(f"unexpected params: {params}")
+
+        mock_session_cls.return_value.get.side_effect = _route
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = os.path.join(tmp, "cache.db")
+            with patch("waygap._CDX_LIMITER"):
+                ensure_archived_db(TARGET, cache_path, workers=1)
+
+            conn = sqlite3.connect(cache_path)
+            try:
+                meta = read_meta(conn)
+                self.assertEqual(meta.get("mode"), "pagination")
+                self.assertEqual(meta.get("completed"), "1")
+                self.assertEqual(count_archived(conn), 1)
+            finally:
+                conn.close()
+        self.assertEqual(num_pages_responses, [])
+
+    @patch("requests.Session")
+    def test_num_pages_persistent_429_stops_before_resumekey(self, mock_session_cls):
+        def _route(url, params=None, headers=None, timeout=None):
+            params = params or {}
+            if "showNumPages" in params:
+                return _status_response(429)
+            raise AssertionError(f"unexpected params: {params}")
+
+        mock_session = mock_session_cls.return_value
+        mock_session.get.side_effect = _route
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = os.path.join(tmp, "cache.db")
+            with (
+                patch("waygap._CDX_LIMITER"),
+                self.assertRaises(CDXAPIError) as cm,
+            ):
+                ensure_archived_db(TARGET, cache_path, workers=1)
+
+            conn = sqlite3.connect(cache_path)
+            try:
+                meta = read_meta(conn)
+            finally:
+                conn.close()
+        self.assertIn("429", str(cm.exception))
+        self.assertEqual(mock_session.get.call_count, 4)
+        self.assertNotEqual(meta.get("mode"), "resumekey")
+        self.assertEqual(meta.get("completed"), "0")
 
     @patch("requests.Session")
     def test_stale_cache_rebuilds(self, mock_session_cls):
