@@ -77,12 +77,13 @@ flowchart TD
 | `_pause` | Waits for `seconds`, raising the internal `_FetchCancelled` once `stop` is set |
 | `_RateLimiter.wait` | Spaces calls at least `interval` seconds apart across threads. The module-level `_CDX_LIMITER` is shared by every CDX request |
 | `_RateLimiter.pause` | Holds every caller's `wait()` for the given number of seconds |
-| `make_session` | Creates a `Session` that retries 5xx responses (HTTP 429 is left to `_cdx_get`) |
+| `make_session` | Creates a `Session` that retries only connection and read errors (HTTP 429 is left to `_cdx_get`, 5xx to `_get_with_retries` and `get_num_pages`) |
 | `_cdx_get` | Sends one GET through the shared limiter; on HTTP 429, pauses every CDX request before sending again |
+| `_wait_after_5xx` | Waits before resending after a 5xx; a Retry-After pauses every CDX request. Shared by `_get_with_retries` and `get_num_pages` |
 | `_cdx_params` | Builds request parameters shared by both fetch paths |
 | `_split_resume_key` | Splits a trailing resumeKey off the raw response |
 | `_strip_header` | Removes the header row (`urlkey`/`original`) at the start of a chunk |
-| `_get_with_retries` | GET with retries, also detecting empty/non-JSON responses |
+| `_get_with_retries` | GET with retries for page and resumeKey fetches (5xx through `_wait_after_5xx`), also detecting empty/non-JSON responses |
 | `get_num_pages` | Fetches the total page count via `showNumPages` |
 | `fetch_page_rows` | Fetches one page |
 | `fetch_resumekey_rows` | Generator for sequential resumeKey fetching |
