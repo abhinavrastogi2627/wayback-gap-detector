@@ -96,6 +96,12 @@ python waygap.py "https://example.com/blog/*" \
 
 You can also add `--output-archived archived.txt` to write the archived URLs to a separate file.
 
+Completed caches are reused until you pass `--refresh`. The reuse log shows the
+UTC build time (or `unknown` if it is missing, invalid, or lacks a time zone).
+It suggests `--refresh` when the cache is at least seven days old or its build
+time is unknown. This is advisory only; caches do not expire automatically.
+Use `--refresh` to include URLs archived since the cache was built.
+
 SQLite errors identify the cache file and keep the underlying error message.
 If the cache is corrupt, use `--refresh` to rebuild it. For unexpected errors,
 add `-v` to include a traceback for troubleshooting.
@@ -111,7 +117,10 @@ If the CDX API answers HTTP 429 (Too Many Requests), the tool pauses all
 requests before trying again, waiting about 7 minutes while the limit
 persists, or up to about 12 minutes if the server asks for longer waits. If
 it still persists, the run stops with an error; wait several minutes, then
-re-run as described in this section.
+re-run as described in this section. If a 5xx response carries Retry-After,
+the tool pauses all requests for that time in the same way; if the server
+asks for more than 4 minutes, the run stops with an error, so re-run after
+that time.
 
 `--resume-key` is only needed for the `resumeKey` fallback path (used when the
 server does not support pagination). If a fallback run fails mid-way, the tool
