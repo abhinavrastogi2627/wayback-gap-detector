@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Generator, Iterable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -60,6 +61,7 @@ IGNORE_WWW = True
 TARGET_URL_FILE = "urls.txt"
 OUTPUT_FILE = "not_archived.txt"
 CACHE_FILE = "archived_cdx.db"
+CACHE_AGE_WARNING = timedelta(days=7)
 ARCHIVED_FILE = "archived.txt"
 
 __version__ = "0.1.0"
@@ -428,6 +430,13 @@ def set_completed(conn: sqlite3.Connection, done: bool = True) -> None:
             "INSERT OR REPLACE INTO meta(k, v) VALUES ('completed', ?);",
             ("1" if done else "0",),
         )
+        if done:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(k, v) VALUES ('built_at', ?);",
+                (datetime.now(UTC).isoformat(),),
+            )
+        else:
+            conn.execute("DELETE FROM meta WHERE k='built_at';")
 
 
 def get_done_pages(conn: sqlite3.Connection) -> set[int]:
@@ -1210,9 +1219,27 @@ def ensure_archived_db(
                 )
                 set_completed(conn, False)
             else:
+                try:
+                    built_at = datetime.fromisoformat(meta.get("built_at", ""))
+                    if built_at.utcoffset() is None:
+                        built_at = None
+                except (TypeError, ValueError):
+                    built_at = None
+                build_time = (
+                    built_at.astimezone(UTC).isoformat()
+                    if built_at is not None
+                    else "unknown"
+                )
+                refresh_hint = (
+                    " Use --refresh to fetch newer archives."
+                    if built_at is None
+                    or datetime.now(UTC) - built_at >= CACHE_AGE_WARNING
+                    else ""
+                )
                 logger.info(
                     f"Reusing completed cache: {cache_file} "
-                    f"({count_archived(conn)} URLs)"
+                    f"({count_archived(conn)} URLs; built at: {build_time})."
+                    f"{refresh_hint}"
                 )
                 return cache_file
 

@@ -22,6 +22,7 @@ import threading
 import time
 import unittest
 import weakref
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -3481,3 +3482,172 @@ class TestVersion(unittest.TestCase):
 
     def test_user_agent_contains_version(self):
         self.assertIn(f"Wayback-Gap-Detector/{__version__}", USER_AGENT)
+
+
+@pytest.mark.parametrize("mode", ["pagination", "fallback", "manual_resume"])
+def test_cache_completion_records_utc_build_time(tmp_path, mode):
+    cache = str(tmp_path / "cache.db")
+    if mode == "manual_resume":
+        conn = open_db(cache)
+        write_meta(
+            conn,
+            {
+                **expected_meta(TARGET, {}, None),
+                "completed": "0",
+                "mode": "resumekey",
+                "resumekey_v": RESUMEKEY_FETCH_VERSION,
+                "resume_key": "KEY1",
+            },
+        )
+        conn.close()
+
+    def route(url, params=None, headers=None, timeout=None):
+        params = params or {}
+        if "showNumPages" in params:
+            return (
+                _json_response(1) if mode == "pagination" else _no_pagination_response()
+            )
+        return _json_response([["original"], ["http://a.example/"]])
+
+    before = datetime.now(UTC)
+    with patch("requests.Session") as session:
+        session.return_value.get.side_effect = route
+        ensure_archived_db(
+            TARGET,
+            cache,
+            workers=1,
+            initial_resume_key="KEY1" if mode == "manual_resume" else None,
+        )
+    after = datetime.now(UTC)
+    with sqlite3.connect(cache) as conn:
+        meta = read_meta(conn)
+    assert meta["completed"] == "1"
+    built_at = datetime.fromisoformat(meta["built_at"])
+    assert built_at.utcoffset() == timedelta(0)
+    assert before <= built_at <= after
+
+
+@pytest.mark.parametrize(
+    ("built_at", "display_time", "refresh_hint"),
+    [
+        (None, "unknown", True),
+        ("", "unknown", True),
+        ("not-a-date", "unknown", True),
+        ("2026-11-19", "unknown", True),
+        ("2026-11-19T12:00:00", "unknown", True),
+        ("2026-11-19T12:00:00+00:00", "2026-11-19T12:00:00+00:00", True),
+        ("2026-11-19T11:59:59.999999+00:00", "2026-11-19T11:59:59.999999+00:00", True),
+        ("2026-11-19T12:00:00.000001+00:00", "2026-11-19T12:00:00.000001+00:00", False),
+        ("2026-11-26T11:00:00+00:00", "2026-11-26T11:00:00+00:00", False),
+        ("2026-11-27T12:00:00+00:00", "2026-11-27T12:00:00+00:00", False),
+        ("2026-11-19T17:30:00+05:30", "2026-11-19T12:00:00+00:00", True),
+    ],
+)
+def test_cache_reuse_reports_build_time_and_refresh_hint(
+    tmp_path, caplog, built_at, display_time, refresh_hint
+):
+    cache = str(tmp_path / "cache.db")
+    conn = open_db(cache)
+    meta = {**expected_meta(TARGET, {}, None), "completed": "1", "mode": "pagination"}
+    if built_at is not None:
+        meta["built_at"] = built_at
+    write_meta(conn, meta)
+    conn.close()
+    with (
+        patch("requests.Session") as session,
+        patch("waygap.datetime", wraps=datetime) as clock,
+        caplog.at_level("INFO", logger="waygap"),
+    ):
+        clock.now.return_value = datetime(2026, 11, 26, 12, tzinfo=UTC)
+        session.return_value.get.side_effect = _no_network
+        assert ensure_archived_db(TARGET, cache) == cache
+    reuse = next(
+        r.message for r in caplog.records if "Reusing completed cache" in r.message
+    )
+    assert f"built at: {display_time}" in reuse
+    assert ("--refresh" in reuse) == refresh_hint
+    with sqlite3.connect(cache) as conn:
+        assert read_meta(conn) == meta
+
+
+def test_cache_reuse_with_null_build_time(tmp_path, caplog):
+    cache = str(tmp_path / "cache.db")
+    conn = open_db(cache)
+    write_meta(conn, {**expected_meta(TARGET, {}, None), "completed": "1"})
+    with conn:
+        conn.execute("INSERT INTO meta(k, v) VALUES ('built_at', NULL)")
+    conn.close()
+    with patch("requests.Session") as session, caplog.at_level("INFO", logger="waygap"):
+        session.return_value.get.side_effect = _no_network
+        assert ensure_archived_db(TARGET, cache) == cache
+    reuse = next(
+        r.message for r in caplog.records if "Reusing completed cache" in r.message
+    )
+    assert "built at: unknown" in reuse
+    assert "--refresh" in reuse
+    with sqlite3.connect(cache) as conn:
+        assert read_meta(conn)["built_at"] is None
+
+
+def test_cache_completion_timestamp_failure_rolls_back_completion(tmp_path):
+    conn = open_db(str(tmp_path / "cache.db"))
+    try:
+        write_meta(conn, {"completed": "0"})
+        conn.execute("""CREATE TRIGGER reject_built_at BEFORE INSERT ON meta
+                        WHEN NEW.k = 'built_at'
+                        BEGIN SELECT RAISE(ABORT, 'disk failure'); END;""")
+        with pytest.raises(sqlite3.IntegrityError, match="disk failure"):
+            waygap.set_completed(conn)
+        assert read_meta(conn) == {"completed": "0"}
+    finally:
+        conn.close()
+
+
+def test_cache_marked_incomplete_clears_build_time(tmp_path):
+    conn = open_db(str(tmp_path / "cache.db"))
+    try:
+        write_meta(conn, {"completed": "1", "built_at": "2020-01-02T03:04:05+00:00"})
+        waygap.set_completed(conn, False)
+        assert read_meta(conn) == {"completed": "0"}
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("mode", ["pagination", "fallback", "manual_resume"])
+def test_interrupted_cache_has_no_build_time(tmp_path, mode):
+    cache = str(tmp_path / "cache.db")
+    if mode == "manual_resume":
+        conn = open_db(cache)
+        write_meta(
+            conn,
+            {
+                **expected_meta(TARGET, {}, None),
+                "completed": "0",
+                "mode": "resumekey",
+                "resumekey_v": RESUMEKEY_FETCH_VERSION,
+                "resume_key": "KEY1",
+            },
+        )
+        conn.close()
+
+    def route(url, params=None, headers=None, timeout=None):
+        params = params or {}
+        if "showNumPages" in params:
+            return (
+                _json_response(1) if mode == "pagination" else _no_pagination_response()
+            )
+        raise KeyboardInterrupt
+
+    with patch("requests.Session") as session:
+        session.return_value.get.side_effect = route
+        with pytest.raises(KeyboardInterrupt):
+            ensure_archived_db(
+                TARGET,
+                cache,
+                workers=1,
+                initial_resume_key="KEY1" if mode == "manual_resume" else None,
+            )
+    with sqlite3.connect(cache) as conn:
+        meta = read_meta(conn)
+    assert meta["completed"] == "0"
+    assert "built_at" not in meta
