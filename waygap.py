@@ -666,20 +666,17 @@ def _server_error_response(error: Exception) -> requests.Response | None:
 
 
 def _wait_after_5xx(
-    response: requests.Response,
-    attempt: int,
-    stop: threading.Event | None,
-    pause_after_last: bool = False,
+    response: requests.Response, attempt: int, stop: threading.Event | None
 ) -> None:
     """Wait before resending after the 5xx `response` to request `attempt` (0-based).
 
     Raises CDXAPIError when Retry-After asks for longer than the last 429
-    pause, even after the last attempt. Otherwise, before the last attempt,
-    a valid nonzero Retry-After pauses every CDX request through the limiter,
-    and this worker also waits CDX_5XX_WAITS[attempt]; the longer of the two
-    decides when it resends. After the last attempt, returns without waiting,
-    but still pauses every CDX request for Retry-After if `pause_after_last`
-    (for a caller that keeps sending other requests after giving up).
+    pause, even after the last attempt. Otherwise a valid nonzero Retry-After
+    pauses every CDX request through the limiter, even after the last
+    attempt (other workers and the resumeKey fallback keep sending until the
+    run stops). Before the last attempt, this worker also waits
+    CDX_5XX_WAITS[attempt]; the longer of the two decides when it resends.
+    After the last attempt, returns without waiting.
     """
     raw = response.headers.get("Retry-After")
     retry_after: float | None = None
@@ -696,14 +693,13 @@ def _wait_after_5xx(
             f"({retry_after:g} s), longer than the {longest:g} s this tool "
             "waits. Re-run after that time."
         )
-    last = attempt >= len(CDX_5XX_WAITS)
-    if retry_after is not None and (not last or pause_after_last):
+    if retry_after is not None:
         logger.warning(
             f"CDX API returned HTTP {status} with Retry-After: {raw}; "
             f"pausing all CDX requests for {retry_after:g} s"
         )
         _CDX_LIMITER.pause(retry_after)
-    if not last:
+    if attempt < len(CDX_5XX_WAITS):
         _pause(CDX_5XX_WAITS[attempt], stop)
 
 
@@ -813,9 +809,7 @@ def get_num_pages(
                     f"showNumPages request error (attempt {attempt + 1}/3): {e}"
                 )
                 # Runs in the main thread, where Ctrl+C interrupts the wait.
-                # After the last 5xx the resumeKey fallback starts sending, so
-                # it must also wait out Retry-After.
-                _wait_after_5xx(server_error, attempt, None, pause_after_last=True)
+                _wait_after_5xx(server_error, attempt, None)
                 if attempt < 2:
                     continue
             logger.info(

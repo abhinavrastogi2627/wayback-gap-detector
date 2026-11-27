@@ -1535,7 +1535,7 @@ class TestCdx5xxRetry(unittest.TestCase):
 
     @patch("waygap.time.sleep")
     @patch("requests.Session")
-    def test_get_with_retries_last_5xx_retry_after_fails_without_pause(
+    def test_get_with_retries_last_5xx_retry_after_pauses_then_fails(
         self, mock_session_cls, mock_sleep
     ):
         mock_session = mock_session_cls.return_value
@@ -1552,7 +1552,7 @@ class TestCdx5xxRetry(unittest.TestCase):
             _get_with_retries(mock_session, self.URL, {}, {})
 
         self.assertEqual(mock_session.get.call_count, 3)
-        mock_limiter.pause.assert_not_called()
+        self.assertEqual(self._pauses(mock_limiter), [120.0])
         self.assertEqual(self._sleeps(mock_sleep), [10.0, 20.0])
 
     @patch("waygap.time.sleep")
