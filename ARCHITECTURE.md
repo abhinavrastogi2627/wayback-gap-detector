@@ -93,6 +93,7 @@ flowchart TD
 
 | Function | Description |
 |---|---|
+| `_cache_error` | Builds a `CacheError` with the failed SQLite database's path and recovery guidance |
 | `ensure_archived_db` | Determines reuse/resume/rebuild (including profile or column-layout mismatches) and builds the DB, returning its path |
 | `_store_resumekey_rows` | Inserts the keys of `fetch_resumekey_rows` rows in batches and returns the count. After a failed request (`ResumeKeyRequestError`), the failed request's key is stored in `meta.resume_key` |
 | `count_input_lines` | Counts total lines quickly for the `scan_input_against_db` progress bar |

@@ -334,6 +334,13 @@ def _input_context(line_no: int) -> str:
 # ========================================
 # SQLite cache layer
 # ========================================
+def _cache_error(path: str, error: sqlite3.Error) -> CacheError:
+    return CacheError(
+        f"Cache database error for {path}: {error}. "
+        "If the cache is corrupt, use --refresh to rebuild it."
+    )
+
+
 def open_db(path: str) -> sqlite3.Connection:
     """Open (and create if needed) the cache database.
 
@@ -344,7 +351,10 @@ def open_db(path: str) -> sqlite3.Connection:
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30.0)
+    try:
+        conn = sqlite3.connect(path, timeout=30.0)
+    except sqlite3.Error as error:
+        raise _cache_error(path, error) from error
     try:
         if is_new:
             # page_size only takes effect for a new database before any tables exist.
@@ -370,8 +380,10 @@ def open_db(path: str) -> sqlite3.Connection:
         # compact/fastest option for integers (deliberately NOT WITHOUT ROWID).
         conn.execute("CREATE TABLE IF NOT EXISTS pages_done(page INTEGER PRIMARY KEY);")
         conn.commit()
-    except Exception:
+    except Exception as error:
         conn.close()
+        if isinstance(error, sqlite3.Error):
+            raise _cache_error(path, error) from error
         raise
     return conn
 
@@ -1217,6 +1229,8 @@ def ensure_archived_db(
             f"All pages fetched successfully ({count_archived(conn)} unique URLs)"
         )
         return cache_file
+    except sqlite3.Error as error:
+        raise _cache_error(cache_file, error) from error
     finally:
         conn.close()
 
@@ -1588,6 +1602,7 @@ examples:
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
 
+    cache_file = args.cache_file
     temp_db: str | None = None
     try:
         try:
@@ -1605,7 +1620,6 @@ examples:
                 f"Cannot read input file: {args.input_file}: {e}"
             ) from e
 
-        cache_file = args.cache_file
         if args.no_cache:
             fd, temp_db = tempfile.mkstemp(prefix="waygap_", suffix=".db")
             os.close(fd)
@@ -1672,6 +1686,9 @@ examples:
     except InputFileError as e:
         logger.error(f"{e}")
         return 1
+    except sqlite3.Error as e:
+        logger.error(f"{_cache_error(cache_file, e)}")
+        return 1
     except CacheError as e:
         logger.error(f"{e}")
         return 1
@@ -1690,7 +1707,7 @@ examples:
             logger.error("Interrupted. Re-run the same command to resume.")
         return 130
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"Unexpected error: {e}", exc_info=args.verbose)
         return 1
     finally:
         if temp_db is not None and os.path.exists(temp_db):

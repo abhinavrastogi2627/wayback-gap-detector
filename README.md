@@ -96,6 +96,10 @@ python waygap.py "https://example.com/blog/*" \
 
 You can also add `--output-archived archived.txt` to write the archived URLs to a separate file.
 
+SQLite errors identify the cache file and keep the underlying error message.
+If the cache is corrupt, use `--refresh` to rebuild it. For unexpected errors,
+add `-v` to include a traceback for troubleshooting.
+
 ### Resume an interrupted fetch
 
 Pagination mode (the default) resumes automatically: completed pages are
