@@ -102,6 +102,10 @@ It suggests `--refresh` when the cache is at least seven days old or its build
 time is unknown. This is advisory only; caches do not expire automatically.
 Use `--refresh` to include URLs archived since the cache was built.
 
+SQLite errors identify the cache file and keep the underlying error message.
+If the cache is corrupt, use `--refresh` to rebuild it. For unexpected errors,
+add `-v` to include a traceback for troubleshooting.
+
 ### Resume an interrupted fetch
 
 Pagination mode (the default) resumes automatically: completed pages are

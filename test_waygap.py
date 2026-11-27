@@ -1986,7 +1986,9 @@ class TestResumeKeyCache(unittest.TestCase):
             _insert.call_args.args[1], [normalize_key("http://a.example/")]
         )
         messages = [r.getMessage() for r in logs.records]
-        self.assertIn("Unexpected error: disk full", messages)
+        self.assertTrue(
+            any(f"{self.cache}: disk full" in message for message in messages)
+        )
         self.assertFalse(any("--resume-key" in m for m in messages), messages)
         self.assertFalse(any("Fetched rows stored" in m for m in messages), messages)
         keys, meta = self._state()
@@ -2030,7 +2032,9 @@ class TestResumeKeyCache(unittest.TestCase):
         self.assertEqual(meta.get("completed"), "0")
         self.assertNotIn("resume_key", meta)
         messages = [record.getMessage() for record in logs.records]
-        self.assertIn("Unexpected error: checkpoint full", messages)
+        self.assertTrue(
+            any(f"{self.cache}: checkpoint full" in message for message in messages)
+        )
         self.assertFalse(any("--resume-key" in message for message in messages))
 
     @patch("requests.Session")
@@ -3651,3 +3655,96 @@ def test_interrupted_cache_has_no_build_time(tmp_path, mode):
         meta = read_meta(conn)
     assert meta["completed"] == "0"
     assert "built_at" not in meta
+
+
+def test_corrupt_cache_raises_contextual_cache_error(tmp_path):
+    cache = tmp_path / "corrupt.db"
+    original = b"this is not a SQLite database" * 10
+    cache.write_bytes(original)
+    with pytest.raises(CacheError) as caught:
+        open_db(str(cache))
+    assert str(cache) in str(caught.value)
+    assert "--refresh" in str(caught.value)
+    assert isinstance(caught.value.__cause__, sqlite3.Error)
+    assert cache.read_bytes() == original
+
+
+@pytest.mark.parametrize("stage", ["fetch", "count", "scan"])
+def test_cli_sqlite_errors_name_cache_and_recovery(tmp_path, caplog, stage):
+    cache = tmp_path / "cache.db"
+    input_file = tmp_path / "urls.txt"
+    input_file.write_text("https://example.com/\n", encoding="utf-8")
+    conn = open_db(str(cache))
+    conn.close()
+    failure = sqlite3.OperationalError("database is locked")
+    with (
+        patch(
+            "sys.argv",
+            ["waygap.py", TARGET, "--input", str(input_file), "--cache", str(cache)],
+        ),
+        patch("waygap.ensure_archived_db", return_value=str(cache)) as fetch,
+        patch("waygap.count_archived", return_value=0) as count,
+        patch("waygap.scan_input_against_db", return_value=(1, 1, 0)) as scan,
+        caplog.at_level("ERROR", logger="waygap"),
+    ):
+        {"fetch": fetch, "count": count, "scan": scan}[stage].side_effect = failure
+        assert main() == 1
+    assert str(cache) in caplog.text
+    assert "database is locked" in caplog.text
+    assert "--refresh" in caplog.text
+    assert "Unexpected error" not in caplog.text
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_unexpected_error_traceback_requires_verbose(tmp_path, caplog, verbose):
+    input_file = tmp_path / "urls.txt"
+    input_file.touch()
+    with (
+        patch(
+            "sys.argv",
+            [
+                "waygap.py",
+                TARGET,
+                "--input",
+                str(input_file),
+                *(["-v"] if verbose else []),
+            ],
+        ),
+        patch(
+            "waygap.ensure_archived_db", side_effect=RuntimeError("unexpected failure")
+        ),
+        caplog.at_level("ERROR", logger="waygap"),
+    ):
+        assert main() == 1
+    assert "Unexpected error: unexpected failure" in caplog.text
+    assert ("Traceback (most recent call last)" in caplog.text) is verbose
+
+
+def test_cli_corrupt_cache_fails_before_network_and_preserves_file(tmp_path, caplog):
+    cache = tmp_path / "cache.db"
+    original = b"not a database" * 32
+    cache.write_bytes(original)
+    input_file = tmp_path / "urls.txt"
+    input_file.write_text("https://example.com/\n", encoding="utf-8")
+    with (
+        patch(
+            "sys.argv",
+            ["waygap.py", TARGET, "--input", str(input_file), "--cache", str(cache)],
+        ),
+        patch("requests.Session") as session,
+        caplog.at_level("ERROR", logger="waygap"),
+    ):
+        assert main() == 1
+    session.assert_not_called()
+    assert str(cache) in caplog.text
+    assert "--refresh" in caplog.text
+    assert "Unexpected error" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert cache.read_bytes() == original
+
+
+def test_cache_connection_failure_is_contextual(tmp_path):
+    with pytest.raises(CacheError) as caught:
+        open_db(str(tmp_path))
+    assert str(tmp_path) in str(caught.value)
+    assert isinstance(caught.value.__cause__, sqlite3.Error)
